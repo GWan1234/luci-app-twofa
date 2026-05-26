@@ -21,7 +21,6 @@ local current_secret = uci:get("twofa", "global", "secret")
 if not current_secret or #current_secret < 16 then
     current_secret = generate_secret()
     uci:set("twofa", "global", "secret", current_secret)
-    uci:save("twofa")
     uci:commit("twofa")
 end
 

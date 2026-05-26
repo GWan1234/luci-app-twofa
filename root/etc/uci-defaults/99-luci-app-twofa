@@ -2,14 +2,17 @@
 # Grant root access to luci-app-twofa ACL on first install.
 
 name="luci-app-twofa"
+changed=0
 
-for login in $(uci -q show rpcd | sed -n "s/^rpcd\.\([^=]*\)=login/\1/p"); do
-	username="$(uci -q get rpcd.${login}.username)"
-	[ "$username" = "root" ] || continue
-	if ! uci -q get "rpcd.${login}.acl" | grep -qx "$name"; then
-		uci add_list "rpcd.${login}.acl=$name"
-	fi
+# Already configured
+uci -q show rpcd 2>/dev/null | grep -qF ".acl=${name}" && exit 0
+
+for sid in $(uci -q show rpcd 2>/dev/null | sed -n 's/^rpcd\.\(@login\[[0-9]*\]\)=login$/\1/p'); do
+	[ -n "$sid" ] || continue
+	[ "$(uci -q get "rpcd.${sid}.username" 2>/dev/null)" = "root" ] || continue
+	uci -q add_list "rpcd.${sid}.acl=${name}" 2>/dev/null && changed=1
 done
 
-uci commit rpcd
+[ "$changed" = "1" ] && uci -q commit rpcd
+
 exit 0
