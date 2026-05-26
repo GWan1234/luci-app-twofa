@@ -29,7 +29,7 @@ end
 m = Map("twofa", translate("Two-Factor Authentication"),
         translate("Protect your router with TOTP-based 2FA (Google Authenticator, Authy, etc.)."))
 
-s = m:section(NamedSection, "global", "settings", translate("Global Settings"))
+s = m:section(NamedSection, "global", "twofa", translate("Global Settings"))
 s.anonymous = true
 s.addremove = false
 

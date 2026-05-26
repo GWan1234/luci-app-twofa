@@ -6,11 +6,11 @@ return baseclass.extend({
     __init__: function() {
         var self = this;
         
-        // 注册请求拦截器：如果未验证，拦截所有非 2FA 的请求
-        LuCI.request.addInterceptor(function(res, req) {
+        LuCI.request.addInterceptor(function(res) {
             if (self.enabled && !self.verified) {
-                // 排除 2FA 自己的验证和状态请求
-                if (req.url.indexOf('/admin/services/twofa/') === -1) {
+                var url = res && res.url ? res.url : '';
+                if (url.indexOf('/admin/services/twofa/') === -1 &&
+                    url.indexOf('/admin/ubus') === -1) {
                     return Promise.reject(new Error('2FA Required'));
                 }
             }
@@ -38,6 +38,7 @@ return baseclass.extend({
                 } else if (self.modal) {
                     self.modal.close();
                     self.modal = null;
+                    document.body.style.overflow = '';
                 }
             } else {
                 self.enabled = false;
@@ -45,9 +46,10 @@ return baseclass.extend({
                 if (self.modal) {
                     self.modal.close();
                     self.modal = null;
+                    document.body.style.overflow = '';
                 }
             }
-        });
+        }).catch(function() {});
     },
 
     showModal: function() {

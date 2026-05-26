@@ -11,11 +11,22 @@ env:
   TZ: Asia/Shanghai
   OPENWRT_VERSION: "24.10.0"
   OPENWRT_BRANCH: "openwrt-24.10"
+  GCC_VERSION: "13.3.0"
 
 jobs:
   build_packages:
-    name: Build IPK
+    name: Build IPK (${{ matrix.platform }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64
+            sdk_target: x86/64
+            sdk_name: x86-64
+          - platform: aarch64
+            sdk_target: armsr/armv8
+            sdk_name: armsr-armv8
 
     steps:
       - name: Checkout
@@ -25,14 +36,16 @@ jobs:
         run: |
           sudo apt-get -qq update
           sudo apt-get -qq install build-essential libncurses-dev gawk git gettext \
-            libssl-dev xsltproc zip zlib1g-dev file zstd rsync python3-pyelftools lua5.1
+            libssl-dev xsltproc zip zlib1g-dev file zstd rsync python3-pyelftools lua5.1 wget
 
       - name: Download OpenWrt SDK
         run: |
-          SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/x86/64/openwrt-sdk-${OPENWRT_VERSION}-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+          SDK_FILE="openwrt-sdk-${OPENWRT_VERSION}-${{ matrix.sdk_name }}_gcc-${GCC_VERSION}_musl.Linux-x86_64.tar.zst"
+          SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${{ matrix.sdk_target }}/${SDK_FILE}"
+          echo "Downloading ${SDK_URL}"
           wget -q "$SDK_URL"
           mkdir -p sdk
-          tar --zstd -xf "openwrt-sdk-${OPENWRT_VERSION}-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst" -C ./sdk --strip-components=1
+          tar --zstd -xf "$SDK_FILE" -C ./sdk --strip-components=1
 
       - name: Inject plugin
         run: |
@@ -66,19 +79,40 @@ jobs:
       - name: Collect IPK
         run: |
           mkdir -p "$GITHUB_WORKSPACE/release"
-          find "$GITHUB_WORKSPACE/sdk/bin/packages" -name "luci-app-twofa*.ipk" -exec cp -t "$GITHUB_WORKSPACE/release" {} +
+          IPK="$(find "$GITHUB_WORKSPACE/sdk/bin/packages" -name 'luci-app-twofa*.ipk' | head -1)"
+          if [ -z "$IPK" ]; then
+            echo "ERROR: luci-app-twofa IPK not found" >&2
+            exit 1
+          fi
+          cp "$IPK" "$GITHUB_WORKSPACE/release/luci-app-twofa_${{ matrix.platform }}_all.ipk"
           ls -lh "$GITHUB_WORKSPACE/release"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: luci-app-twofa
+          name: luci-app-twofa-${{ matrix.platform }}
           path: ${{ github.workspace }}/release/*.ipk
 
+  release_upload:
+    name: Upload Release Assets
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build_packages
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all IPK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: luci-app-twofa-*
+          merge-multiple: true
+
+      - name: List release files
+        run: find artifacts -name '*.ipk' -exec ls -lh {} \;
+
       - name: Upload to Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ github.workspace }}/release/*.ipk
+          files: artifacts/**/*.ipk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

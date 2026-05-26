@@ -52,11 +52,16 @@ $SCP_CMD root/usr/share/rpcd/acl.d/luci-app-twofa.json $ROUTER_USER@$ROUTER_HOST
 echo "Syncing Config..."
 $SCP_CMD root/etc/config/twofa $ROUTER_USER@$ROUTER_HOST:/etc/config/
 
-# 9. 重启服务
+# 9. 应用 UCI 默认值（为 root 授予 ACL）
+echo "Applying uci-defaults..."
+$SCP_CMD root/etc/uci-defaults/99-luci-app-twofa $ROUTER_USER@$ROUTER_HOST:/etc/uci-defaults/
+$SSH_CMD "[ -x /etc/uci-defaults/99-luci-app-twofa ] && /etc/uci-defaults/99-luci-app-twofa || true"
+
+# 10. 重启服务
 echo "Restarting RPCD..."
 $SSH_CMD "/etc/init.d/rpcd restart"
 
-# 10. 清除 LuCI 缓存 (可选)
+# 11. 清除 LuCI 缓存
 $SSH_CMD "rm -rf /tmp/luci-indexcache /tmp/luci-modulecache"
 
 echo "部署完成！请刷新浏览器测试。"
