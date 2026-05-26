@@ -1,0 +1,62 @@
+#!/bin/bash
+
+# 使用方法: ./deploy.sh [路由器地址] [端口]
+# 示例:
+#   ./deploy.sh 192.168.52.11
+#   ./deploy.sh homeproxy.404area.vip 36666
+
+ROUTER_HOST=${1:-192.168.52.11}
+ROUTER_PORT=${2:-22}
+ROUTER_USER="root"
+
+echo "正在部署到 $ROUTER_USER@$ROUTER_HOST:$ROUTER_PORT ..."
+
+# 定义 SSH 和 SCP 命令，包含端口参数
+SSH_CMD="ssh -p $ROUTER_PORT $ROUTER_USER@$ROUTER_HOST"
+SCP_CMD="scp -P $ROUTER_PORT"
+
+# 1. 确保目标目录存在
+$SSH_CMD "mkdir -p /usr/lib/lua/luci/controller/admin/system/ \
+/usr/lib/lua/luci/model/cbi/admin_system/ \
+/usr/lib/lua/luci/twofa/ \
+/www/luci-static/resources/preload/ \
+/usr/share/luci/menu.d/ \
+/usr/share/rpcd/acl.d/ \
+/etc/config/ \
+/etc/uci-defaults/"
+
+# 2. 复制 Lua 控制器
+echo "Syncing Controller..."
+$SCP_CMD luasrc/controller/admin/system/twofa.lua $ROUTER_USER@$ROUTER_HOST:/usr/lib/lua/luci/controller/admin/system/
+
+# 3. 复制 Lua 模型 (CBI)
+echo "Syncing Model..."
+$SCP_CMD luasrc/model/cbi/admin_system/twofa.lua $ROUTER_USER@$ROUTER_HOST:/usr/lib/lua/luci/model/cbi/admin_system/
+
+# 4. 复制核心库 (Auth & TOTP)
+echo "Syncing Libraries..."
+$SCP_CMD luasrc/twofa/*.lua $ROUTER_USER@$ROUTER_HOST:/usr/lib/lua/luci/twofa/
+
+# 5. 复制视图 (Hook)
+
+# 6. 复制静态资源 (JS)
+echo "Syncing JS..."
+$SCP_CMD htdocs/luci-static/resources/preload/twofa.js $ROUTER_USER@$ROUTER_HOST:/www/luci-static/resources/preload/
+
+# 7. 复制菜单与 ACL
+echo "Syncing menu and ACL..."
+$SCP_CMD root/usr/share/luci/menu.d/luci-app-twofa.json $ROUTER_USER@$ROUTER_HOST:/usr/share/luci/menu.d/
+$SCP_CMD root/usr/share/rpcd/acl.d/luci-app-twofa.json $ROUTER_USER@$ROUTER_HOST:/usr/share/rpcd/acl.d/
+
+# 8. 复制配置文件 (关键修复：之前漏了这一步，导致 ubus code 4 错误)
+echo "Syncing Config..."
+$SCP_CMD root/etc/config/twofa $ROUTER_USER@$ROUTER_HOST:/etc/config/
+
+# 9. 重启服务
+echo "Restarting RPCD..."
+$SSH_CMD "/etc/init.d/rpcd restart"
+
+# 10. 清除 LuCI 缓存 (可选)
+$SSH_CMD "rm -rf /tmp/luci-indexcache /tmp/luci-modulecache"
+
+echo "部署完成！请刷新浏览器测试。"

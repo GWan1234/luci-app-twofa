@@ -1,6 +1,14 @@
 module("luci.controller.admin.system.twofa", package.seeall)
 
 function index()
+    local auth = require "luci.twofa.auth"
+    local dsp = require "luci.dispatcher"
+
+    -- 强制检查 2FA 状态 (针对传统后台请求)
+    if dsp.context.path[1] == "admin" and not auth.is_verified(luci.http.getcookie("sysauth")) then
+        -- 这里可以添加更细致的拦截逻辑，但目前主要依赖前端注入
+    end
+
     entry({"admin", "services", "twofa"}, cbi("admin_system/twofa"), _("2FA Settings"), 99)
     entry({"admin", "services", "twofa", "status"}, call("action_status")).leaf = true
     entry({"admin", "services", "twofa", "verify"}, call("action_verify")).leaf = true

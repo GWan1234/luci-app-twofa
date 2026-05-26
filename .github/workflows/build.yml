@@ -9,97 +9,75 @@ on:
 
 env:
   TZ: Asia/Shanghai
+  OPENWRT_VERSION: "24.10.0"
+  OPENWRT_BRANCH: "openwrt-24.10"
 
 jobs:
   build_packages:
-    name: Build [${{ matrix.target.platform }}]
+    name: Build IPK
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - platform: "x86_64"
-            sdk_url: "https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
-          - platform: "aarch64_generic"
-            sdk_url: "https://downloads.openwrt.org/releases/24.10.0/targets/rockchip/armv8/openwrt-sdk-24.10.0-rockchip-armv8_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Initialization environment
+      - name: Install build tools
         run: |
-          sudo -E apt-get -qq update
-          sudo -E apt-get -qq install build-essential libncurses-dev gawk git gettext libssl-dev xsltproc zip zlib1g-dev file zstd rsync python3-pyelftools
-          # 手动安装编译 lmo 的工具（如果 SDK 没带的话）
-          sudo -E apt-get -qq install lua5.1    
+          sudo apt-get -qq update
+          sudo apt-get -qq install build-essential libncurses-dev gawk git gettext \
+            libssl-dev xsltproc zip zlib1g-dev file zstd rsync python3-pyelftools lua5.1
 
       - name: Download OpenWrt SDK
         run: |
-          wget -q ${{ matrix.target.sdk_url }}
-          file_name=$(basename ${{ matrix.target.sdk_url }})
+          SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/x86/64/openwrt-sdk-${OPENWRT_VERSION}-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+          wget -q "$SDK_URL"
           mkdir -p sdk
-          tar --zstd -xf $file_name -C ./sdk --strip-components=1
-          cd sdk
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          tar --zstd -xf "openwrt-sdk-${OPENWRT_VERSION}-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst" -C ./sdk --strip-components=1
 
-      - name: Clean and Inject Plugin
+      - name: Inject plugin
         run: |
-          # 1. 创建干净的目录
           DEST="$GITHUB_WORKSPACE/sdk/package/luci-app-twofa"
-          mkdir -p $DEST
-          
-          # 2. 仅拷贝必要文件，彻底排除 SDK 压缩包等垃圾文件
-          cp -r Makefile luasrc root htdocs po $DEST/ 2>/dev/null || true
-          
-          # 3. 彻底删除可能存在的干扰项
-          find $DEST -name "*.zst" -delete
-          find $DEST -name "*.iml" -delete
-          
-          # 4. 打印 Makefile 确认位置
-          ls -l $DEST/Makefile
+          rm -rf "$DEST"
+          mkdir -p "$DEST"
+          cp -r Makefile luasrc root htdocs po "$DEST/"
+          find "$DEST" -name "*.iml" -delete
 
-      - name: Configure and Compile
+      - name: Prepare feeds
         run: |
-          cd $GITHUB_WORKSPACE/sdk
-          
-          # 刷新索引
+          cd "$GITHUB_WORKSPACE/sdk"
+          ./scripts/feeds update base packages routing telephony || true
+          if [ ! -f feeds/luci/luci.mk ]; then
+            rm -rf feeds/luci
+            git clone --depth 1 -b "$OPENWRT_BRANCH" https://github.com/openwrt/luci.git feeds/luci \
+              || git clone --depth 1 https://github.com/openwrt/luci.git feeds/luci
+          fi
+          ./scripts/feeds install luci-base luci-compat luci-lib-nixio qrencode
+
+      - name: Configure and compile
+        run: |
+          cd "$GITHUB_WORKSPACE/sdk"
           rm -rf tmp
           make package/symlinks
-          
-          # 强行激活
-          echo "CONFIG_PACKAGE_luci-app-twofa=m" > .config
+          echo "CONFIG_PACKAGE_luci-app-twofa=m" >> .config
           make defconfig
-          
-          # 检查结果
-          if ! grep -q "CONFIG_PACKAGE_luci-app-twofa=m" .config; then
-            echo "错误: 插件依然无法激活。正在检查 Makefile 内容..."
-            cat package/luci-app-twofa/Makefile
-            exit 1
-          fi
-
-          # 编译
-          make package/luci-app-twofa/compile -j$(nproc) V=s IGNORE_ERRORS=1
+          grep '^CONFIG_PACKAGE_luci-app-twofa=m' .config
+          make package/luci-app-twofa/compile -j"$(nproc)" V=s
 
       - name: Collect IPK
         run: |
-          mkdir -p $GITHUB_WORKSPACE/release
-          find $GITHUB_WORKSPACE/sdk/bin/packages -name "luci-app-twofa*.ipk" -exec cp {} $GITHUB_WORKSPACE/release/ \;
-          if [ -z "$(ls -A $GITHUB_WORKSPACE/release)" ]; then
-            echo "未发现生成的 IPK"
-            exit 1
-          fi
+          mkdir -p "$GITHUB_WORKSPACE/release"
+          find "$GITHUB_WORKSPACE/sdk/bin/packages" -name "luci-app-twofa*.ipk" -exec cp -t "$GITHUB_WORKSPACE/release" {} +
+          ls -lh "$GITHUB_WORKSPACE/release"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: luci-app-twofa-${{ matrix.target.platform }}
+          name: luci-app-twofa
           path: ${{ github.workspace }}/release/*.ipk
 
       - name: Upload to Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: ${{ github.workspace }}/release/*.ipk
         env:

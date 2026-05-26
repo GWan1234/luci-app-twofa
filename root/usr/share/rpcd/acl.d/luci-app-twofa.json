@@ -6,18 +6,17 @@
             "file": {
                 "/etc/config/twofa": [ "read" ],
                 "/usr/lib/lua/luci/twofa/*": [ "read" ],
-                "/www/luci-static/resources/twofa.js": [ "read" ]
+                "/www/luci-static/resources/preload/twofa.js": [ "read" ],
+                "/var/run/luci-twofa-sessions.json": [ "read", "write" ]
             },
             "uci": [ "twofa" ]
         },
         "write": {
             "file": {
-                "/etc/config/twofa": [ "write" ]
+                "/etc/config/twofa": [ "write" ],
+                "/var/run/luci-twofa-sessions.json": [ "write" ]
             },
             "uci": [ "twofa" ]
-        },
-        "access-group": {
-            "group": [ "read", "write" ]
         }
     }
 }
