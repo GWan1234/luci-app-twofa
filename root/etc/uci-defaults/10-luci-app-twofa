@@ -1,0 +1,87 @@
+#!/bin/sh
+# Initialize twofa config and grant rpcd ACL for root.
+# Must not run "uci get" on /etc/config/twofa until the file is valid.
+
+name="luci-app-twofa"
+changed_twofa=0
+changed_rpcd=0
+
+write_twofa_config() {
+	cat > /etc/config/twofa <<'EOF'
+config twofa 'global'
+	option enabled '0'
+	option issuer 'OpenWrt'
+EOF
+}
+
+generate_secret() {
+	# Base32 secret for TOTP (16 chars, A-Z2-7). Prefer openssl, fallback to awk.
+	if command -v openssl >/dev/null 2>&1; then
+		openssl rand -base32 20 2>/dev/null | tr -d '= \n' | cut -c1-16
+		return
+	fi
+	awk 'BEGIN {
+		split("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", c, "")
+		for (i = 1; i <= 16; i++)
+			printf "%s", c[int(rand() * 32) + 1]
+	}'
+}
+
+twofa_config_ok() {
+	[ -s /etc/config/twofa ] && uci -q show twofa >/dev/null 2>&1
+}
+
+# --- twofa: recreate broken/empty config before any other uci command ---
+if ! twofa_config_ok; then
+	write_twofa_config
+	changed_twofa=1
+fi
+
+# Migrate legacy section type: config settings 'global'
+typ="$(uci -q get twofa.global 2>/dev/null)" || typ=""
+if [ "$typ" = "settings" ]; then
+	uci -q set twofa.global=twofa
+	changed_twofa=1
+fi
+
+if ! uci -q get twofa.global >/dev/null 2>&1; then
+	uci -q set twofa.global=twofa
+	uci -q set twofa.global.enabled='0'
+	uci -q set twofa.global.issuer='OpenWrt'
+	changed_twofa=1
+fi
+
+secret="$(uci -q get twofa.global.secret 2>/dev/null)" || secret=""
+if [ -n "$secret" ] && [ -z "$(echo "$secret" | tr -d ' \t')" ]; then
+	uci -q delete twofa.global.secret 2>/dev/null
+	secret=""
+	changed_twofa=1
+fi
+
+if [ -z "$secret" ]; then
+	uci -q set "twofa.global.secret=$(generate_secret)"
+	changed_twofa=1
+fi
+
+[ "$changed_twofa" = "1" ] && uci -q commit twofa
+
+# --- rpcd ACL for root (supports @login[0] and named login sections) ---
+[ -f /etc/config/rpcd ] || exit 0
+
+if uci -q show rpcd 2>/dev/null | grep -qF "${name}"; then
+	exit 0
+fi
+
+for line in $(uci -q show rpcd 2>/dev/null | grep '=login$'); do
+	sid="${line#rpcd.}"
+	sid="${sid%%=*}"
+	[ -n "$sid" ] || continue
+	[ "$(uci -q get "rpcd.${sid}.username" 2>/dev/null)" = "root" ] || continue
+	if ! uci -q show "rpcd.${sid}" 2>/dev/null | grep -qF ".acl=${name}"; then
+		uci -q add_list "rpcd.${sid}.acl=${name}" 2>/dev/null && changed_rpcd=1
+	fi
+done
+
+[ "$changed_rpcd" = "1" ] && uci -q commit rpcd
+
+exit 0

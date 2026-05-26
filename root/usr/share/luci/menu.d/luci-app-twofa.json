@@ -1,6 +1,6 @@
 {
     "admin/services/twofa": {
-        "title": "Two-Factor Auth",
+        "title": "2FA Settings",
         "action": { "type": "cbi", "path": "admin_system/twofa" },
         "depends": { "acl": [ "luci-app-twofa" ] }
     }

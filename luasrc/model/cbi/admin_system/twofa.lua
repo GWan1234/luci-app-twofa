@@ -1,98 +1,158 @@
 local uci = require "luci.model.uci".cursor()
 local sys = require "luci.sys"
-local fs  = require "nixio.fs"
+local util = require "luci.util"
+local fs = require "nixio.fs"
 
--- 定义辅助函数：生成随机 Base32 密钥 (16字符)
+local QR_TMP = "/tmp/luci-twofa-qr.png"
+
 local function generate_secret()
-    local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-    local secret = ""
-    math.randomseed(os.time())
-    for i = 1, 16 do
-        local rand = math.random(1, #chars)
-        secret = secret .. string.sub(chars, rand, rand)
-    end
-    return secret
+	local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+	local secret = ""
+	math.randomseed(os.time())
+	for i = 1, 16 do
+		local idx = math.random(1, #chars)
+		secret = secret .. chars:sub(idx, idx)
+	end
+	return secret
 end
+
+local function escape_html(s)
+	return (tostring(s or ""):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"))
+end
+
+local function urlencode(str)
+	return (str:gsub("([^%w%-%.%_%~])", function(c)
+		return string.format("%%%02X", string.byte(c))
+	end))
+end
+
+local function file_base64(path)
+	if not path or not fs.access(path) then
+		return nil
+	end
+
+	local out = util.trim(sys.exec("base64 -w 0 " .. util.shellquote(path) .. " 2>/dev/null") or "")
+	if out and #out > 0 then
+		return out
+	end
+
+	out = util.trim(sys.exec("openssl base64 -A -in " .. util.shellquote(path) .. " 2>/dev/null") or "")
+	if out and #out > 0 then
+		return out
+	end
+
+	return nil
+end
+
+local function build_qr_html(secret)
+	if not secret or #secret < 16 then
+		return '<div style="color:#c00;">' ..
+			translate("Secret key is not ready yet. Save settings or reload the page.") ..
+			'</div>'
+	end
+
+	if sys.call("which qrencode >/dev/null 2>&1") ~= 0 then
+		return '<div style="color:#c00;">' ..
+			translate("Error: 'qrencode' package is missing. Install: opkg install qrencode") ..
+			'</div>'
+	end
+
+	local hostname = sys.hostname() or "OpenWrt"
+	local label = urlencode(hostname) .. ":root"
+	local issuer = urlencode(hostname)
+	local otp_uri = string.format(
+		"otpauth://totp/%s?secret=%s&issuer=%s",
+		label, secret, issuer
+	)
+
+	fs.unlink(QR_TMP)
+	local rc = sys.call(string.format(
+		"qrencode -t PNG -o %s -s 6 %s >/dev/null 2>&1",
+		util.shellquote(QR_TMP),
+		util.shellquote(otp_uri)
+	))
+
+	if rc ~= 0 or not fs.access(QR_TMP) then
+		return '<div style="color:#c00;">' ..
+			translate("Failed to generate QR code. Check system log (logread | grep twofa).") ..
+			'</div>'
+	end
+
+	local b64 = file_base64(QR_TMP)
+	fs.unlink(QR_TMP)
+
+	if not b64 or #b64 == 0 then
+		return '<div style="color:#c00;">' ..
+			translate("Failed to encode QR image (base64/openssl missing).") ..
+			'</div>'
+	end
+
+	return string.format(
+		'<div style="margin:10px 0;"><img src="data:image/png;base64,%s" alt="QR Code" style="border:1px solid #ccc;padding:8px;background:#fff;max-width:220px;"/></div>',
+		b64:gsub("%s+", "")
+	)
+end
+
+local current_secret
+local ok = pcall(function()
+	current_secret = uci:get("twofa", "global", "secret")
+end)
+
+if not ok or not current_secret or #current_secret < 16 then
+	current_secret = generate_secret()
+	pcall(function()
+		uci:set("twofa", "global", "secret", current_secret)
+		uci:commit("twofa")
+	end)
+end
+
+local qr_html = build_qr_html(current_secret)
 
 local m, s, o
 
--- 1. 检查并初始化配置
-local current_secret = uci:get("twofa", "global", "secret")
-if not current_secret or #current_secret < 16 then
-    current_secret = generate_secret()
-    uci:set("twofa", "global", "secret", current_secret)
-    uci:commit("twofa")
-end
-
--- 2. 构建 CBI 映射
 m = Map("twofa", translate("Two-Factor Authentication"),
-        translate("Protect your router with TOTP-based 2FA (Google Authenticator, Authy, etc.)."))
+	translate("Protect your router with TOTP-based 2FA (Google Authenticator, Authy, etc.)."))
 
 s = m:section(NamedSection, "global", "twofa", translate("Global Settings"))
 s.anonymous = true
 s.addremove = false
 
--- 3. 启用/禁用开关
 o = s:option(Flag, "enabled", translate("Enable 2FA"),
-        translate("Enforce two-factor authentication for OpenWrt Web Interface."))
+	translate("Enforce two-factor authentication for OpenWrt Web Interface."))
 o.rmempty = false
 
--- 4. 显示密钥文本 (只读)
 o = s:option(DummyValue, "_secret_display", translate("Secret Key"))
-o.default = current_secret
+o.rawhtml = true
+function o.cfgvalue()
+	return string.format(
+		'<code style="font-size:16px;letter-spacing:2px;">%s</code>',
+		escape_html(current_secret or "")
+	)
+end
 o.description = translate("Enter this key manually if you cannot scan the QR code.")
 
--- 5. 生成并显示二维码
--- 这里我们利用 qrencode 命令行工具生成 PNG 并转为 base64 内嵌显示
--- OTP Auth URI 格式: otpauth://totp/OpenWrt:root?secret=KEY&issuer=OpenWrt
-local hostname = sys.hostname() or "OpenWrt"
-local otp_uri = string.format("otpauth://totp/%s:root?secret=%s&issuer=%s",
-        hostname, current_secret, hostname)
-
--- 尝试生成二维码 HTML
-local qr_html = ""
--- 尝试使用 ucode-mod-qrencode 或者 qrencode 命令行
-local has_qrencode = sys.call("which qrencode >/dev/null 2>&1") == 0
-
-if has_qrencode then
-    -- 使用 popen 读取 qrencode 输出
-    -- -t PNG: 输出 PNG 格式
-    -- -o - : 输出到标准输出
-    -- -s 5 : 像素大小
-    local cmd = string.format("qrencode -t PNG -o - -s 5 '%s' | base64", otp_uri)
-    local fp = io.popen(cmd)
-    if fp then
-        local base64_img = fp:read("*a")
-        fp:close()
-        if base64_img and #base64_img > 0 then
-            qr_html = string.format('<div style="margin: 10px 0;"><img src="data:image/png;base64,%s" alt="QR Code" style="border:1px solid #ccc; padding:5px;"/></div>', base64_img:gsub("\n", ""))
-        end
-    end
-else
-    -- 尝试使用 JS 库生成 (如果后端没有 qrencode)
-    -- 这里我们先显示一个提示，或者使用在线 API (不推荐)
-    qr_html = '<div style="color:red; margin: 10px 0;">' .. translate("Error: 'qrencode' package is missing. Please install it to view QR Code.") .. '</div>'
-end
-
 o = s:option(DummyValue, "_qr_code", translate("QR Code"))
-o.rawhtml = true -- 允许渲染 HTML
-o.default = qr_html
+o.rawhtml = true
+function o.cfgvalue()
+	return build_qr_html(current_secret)
+end
 o.description = translate("Scan this with your authenticator app.")
 
--- 6. 添加一个按钮用于重置密钥 (可选)
--- CBI 中实现按钮稍微复杂，通常建议用户直接删除配置文件来重置，或者在这里加一个 Checkbox "Reset Secret"
 o = s:option(Flag, "reset_secret", translate("Regenerate Secret"),
-        translate("Check this and save to generate a new secret key. WARNING: Your old codes will stop working immediately."))
+	translate("Check this and save to generate a new secret key. WARNING: Your old codes will stop working immediately."))
 o.rmempty = true
+o.default = "0"
+
+function o.cfgvalue()
+	return "0"
+end
 
 function o.write(self, section, value)
-    if value == "1" then
-        local new_secret = generate_secret()
-        uci:set("twofa", "global", "secret", new_secret)
-        -- 这里不需要调用 uci:commit，Map 会自动处理
-        -- 设置标记，提示用户密钥已更新
-        sys.call("logger -t twofa 'Secret key regenerated by user'")
-    end
+	if value == "1" then
+		current_secret = generate_secret()
+		uci:set("twofa", "global", "secret", current_secret)
+		sys.call("logger -t twofa 'Secret key regenerated by user'")
+	end
 end
 
 return m

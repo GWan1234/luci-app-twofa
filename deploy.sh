@@ -54,8 +54,8 @@ $SCP_CMD root/etc/config/twofa $ROUTER_USER@$ROUTER_HOST:/etc/config/
 
 # 9. 应用 UCI 默认值（为 root 授予 ACL）
 echo "Applying uci-defaults..."
-$SCP_CMD root/etc/uci-defaults/99-luci-app-twofa $ROUTER_USER@$ROUTER_HOST:/etc/uci-defaults/
-$SSH_CMD "[ -x /etc/uci-defaults/99-luci-app-twofa ] && /etc/uci-defaults/99-luci-app-twofa || true"
+$SCP_CMD root/etc/uci-defaults/10-luci-app-twofa $ROUTER_USER@$ROUTER_HOST:/etc/uci-defaults/
+$SSH_CMD "rm -f /etc/uci-defaults/98-luci-app-twofa /etc/uci-defaults/99-luci-app-twofa; [ -x /etc/uci-defaults/10-luci-app-twofa ] && /etc/uci-defaults/10-luci-app-twofa || true"
 
 # 10. 重启服务
 echo "Restarting RPCD..."
