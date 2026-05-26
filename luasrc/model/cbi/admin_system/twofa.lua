@@ -1,9 +1,6 @@
 local uci = require "luci.model.uci".cursor()
 local sys = require "luci.sys"
 local util = require "luci.util"
-local fs = require "nixio.fs"
-
-local QR_TMP = "/tmp/luci-twofa-qr.png"
 
 local function generate_secret()
 	local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
@@ -26,22 +23,14 @@ local function urlencode(str)
 	end))
 end
 
-local function file_base64(path)
-	if not path or not fs.access(path) then
-		return nil
-	end
-
-	local out = util.trim(sys.exec("base64 -w 0 " .. util.shellquote(path) .. " 2>/dev/null") or "")
-	if out and #out > 0 then
-		return out
-	end
-
-	out = util.trim(sys.exec("openssl base64 -A -in " .. util.shellquote(path) .. " 2>/dev/null") or "")
-	if out and #out > 0 then
-		return out
-	end
-
-	return nil
+local function build_otp_uri(secret)
+	local hostname = sys.hostname() or "OpenWrt"
+	local label = urlencode(hostname) .. ":root"
+	local issuer = urlencode(hostname)
+	return string.format(
+		"otpauth://totp/%s?secret=%s&issuer=%s",
+		label, secret, issuer
+	)
 end
 
 local function build_qr_html(secret)
@@ -51,46 +40,32 @@ local function build_qr_html(secret)
 			'</div>'
 	end
 
+	local otp_uri = build_otp_uri(secret)
+
+	if sys.call("which qrencode >/dev/null 2>&1") == 0 then
+		-- OpenWrt qrencode is built without PNG; SVG inline output works everywhere.
+		local qr_svg = util.trim(sys.exec(string.format(
+			"qrencode --inline --8bit --type=SVG --output=- %s 2>/dev/null",
+			util.shellquote(otp_uri)
+		)) or "")
+
+		if qr_svg ~= "" and qr_svg:find("<svg") then
+			return string.format(
+				'<div style="margin:10px 0;max-width:220px;">%s</div>',
+				qr_svg
+			)
+		end
+	end
+
 	if sys.call("which qrencode >/dev/null 2>&1") ~= 0 then
 		return '<div style="color:#c00;">' ..
 			translate("Error: 'qrencode' package is missing. Install: opkg install qrencode") ..
 			'</div>'
 	end
 
-	local hostname = sys.hostname() or "OpenWrt"
-	local label = urlencode(hostname) .. ":root"
-	local issuer = urlencode(hostname)
-	local otp_uri = string.format(
-		"otpauth://totp/%s?secret=%s&issuer=%s",
-		label, secret, issuer
-	)
-
-	fs.unlink(QR_TMP)
-	local rc = sys.call(string.format(
-		"qrencode -t PNG -o %s -s 6 %s >/dev/null 2>&1",
-		util.shellquote(QR_TMP),
-		util.shellquote(otp_uri)
-	))
-
-	if rc ~= 0 or not fs.access(QR_TMP) then
-		return '<div style="color:#c00;">' ..
-			translate("Failed to generate QR code. Check system log (logread | grep twofa).") ..
-			'</div>'
-	end
-
-	local b64 = file_base64(QR_TMP)
-	fs.unlink(QR_TMP)
-
-	if not b64 or #b64 == 0 then
-		return '<div style="color:#c00;">' ..
-			translate("Failed to encode QR image (base64/openssl missing).") ..
-			'</div>'
-	end
-
-	return string.format(
-		'<div style="margin:10px 0;"><img src="data:image/png;base64,%s" alt="QR Code" style="border:1px solid #ccc;padding:8px;background:#fff;max-width:220px;"/></div>',
-		b64:gsub("%s+", "")
-	)
+	return '<div style="color:#c00;">' ..
+		translate("Failed to generate QR code. Check system log (logread | grep twofa).") ..
+		'</div>'
 end
 
 local current_secret
@@ -105,8 +80,6 @@ if not ok or not current_secret or #current_secret < 16 then
 		uci:commit("twofa")
 	end)
 end
-
-local qr_html = build_qr_html(current_secret)
 
 local m, s, o
 

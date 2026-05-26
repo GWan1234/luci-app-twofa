@@ -1,34 +1,4 @@
 #!/bin/sh
-# Ensure /etc/config/twofa is valid and migrate legacy section type.
-
-changed=0
-
-[ -f /etc/config/twofa ] || exit 0
-
-# Migrate old CBI bug: "config settings 'global'" -> "config twofa 'global'"
-if uci -q get twofa.global >/dev/null 2>&1; then
-	typ="$(uci -q get twofa.global 2>/dev/null)"
-	if [ "$typ" = "settings" ]; then
-		uci -q set twofa.global=twofa
-		changed=1
-	fi
-fi
-
-# Create global section if missing
-if ! uci -q get twofa.global >/dev/null 2>&1; then
-	uci -q set twofa.global=twofa
-	uci -q set twofa.global.enabled='0'
-	uci -q set twofa.global.issuer='OpenWrt'
-	changed=1
-fi
-
-# Drop empty secret option
-secret="$(uci -q get twofa.global.secret 2>/dev/null)" || secret=""
-if [ -n "$secret" ] && [ -z "$(echo "$secret" | tr -d " \t")" ]; then
-	uci -q delete twofa.global.secret 2>/dev/null
-	changed=1
-fi
-
-[ "$changed" = "1" ] && uci -q commit twofa
-
+# Deprecated: merged into 10-luci-app-twofa. Remove stale copy on upgrade.
+rm -f "$0"
 exit 0

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Initialize twofa config and grant rpcd ACL for root.
-# Must not run "uci get" on /etc/config/twofa until the file is valid.
+# Never run uci against /etc/config/twofa until the file parses cleanly.
 
 name="luci-app-twofa"
 changed_twofa=0
@@ -28,10 +28,11 @@ generate_secret() {
 }
 
 twofa_config_ok() {
-	[ -s /etc/config/twofa ] && uci -q show twofa >/dev/null 2>&1
+	[ -f /etc/config/twofa ] || return 1
+	uci -q show twofa >/dev/null 2>&1
 }
 
-# --- twofa: recreate broken/empty config before any other uci command ---
+# --- twofa: recreate broken/empty/whitespace-only config before any uci access ---
 if ! twofa_config_ok; then
 	write_twofa_config
 	changed_twofa=1
@@ -59,7 +60,7 @@ if [ -n "$secret" ] && [ -z "$(echo "$secret" | tr -d ' \t')" ]; then
 fi
 
 if [ -z "$secret" ]; then
-	uci -q set "twofa.global.secret=$(generate_secret)"
+	uci -q set twofa.global.secret="$(generate_secret)"
 	changed_twofa=1
 fi
 
@@ -68,7 +69,7 @@ fi
 # --- rpcd ACL for root (supports @login[0] and named login sections) ---
 [ -f /etc/config/rpcd ] || exit 0
 
-if uci -q show rpcd 2>/dev/null | grep -qF "${name}"; then
+if uci -q show rpcd 2>/dev/null | grep -qF ".acl=${name}"; then
 	exit 0
 fi
 

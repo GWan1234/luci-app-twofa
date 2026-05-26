@@ -19,6 +19,7 @@ SCP_CMD="scp -P $ROUTER_PORT"
 $SSH_CMD "mkdir -p /usr/lib/lua/luci/controller/admin/system/ \
 /usr/lib/lua/luci/model/cbi/admin_system/ \
 /usr/lib/lua/luci/twofa/ \
+/usr/lib/lua/luci/i18n/ \
 /www/luci-static/resources/preload/ \
 /usr/share/luci/menu.d/ \
 /usr/share/rpcd/acl.d/ \
@@ -43,6 +44,21 @@ $SCP_CMD luasrc/twofa/*.lua $ROUTER_USER@$ROUTER_HOST:/usr/lib/lua/luci/twofa/
 echo "Syncing JS..."
 $SCP_CMD htdocs/luci-static/resources/preload/twofa.js $ROUTER_USER@$ROUTER_HOST:/www/luci-static/resources/preload/
 
+# 6b. 部署中文翻译（需要 po2lmo，或通过 IPK 安装获得完整 i18n）
+if command -v po2lmo >/dev/null 2>&1; then
+	echo "Syncing i18n..."
+	for lang in zh-cn zh_Hans; do
+		po="po/${lang}/luci-app-twofa.po"
+		if [ -f "$po" ]; then
+			po2lmo "$po" "/tmp/luci-app-twofa.${lang}.lmo"
+			$SCP_CMD "/tmp/luci-app-twofa.${lang}.lmo" "$ROUTER_USER@$ROUTER_HOST:/usr/lib/lua/luci/i18n/"
+			rm -f "/tmp/luci-app-twofa.${lang}.lmo"
+		fi
+	done
+else
+	echo "提示: 未找到 po2lmo，中文界面需通过 IPK 安装或手动编译 .lmo 文件"
+fi
+
 # 7. 复制菜单与 ACL
 echo "Syncing menu and ACL..."
 $SCP_CMD root/usr/share/luci/menu.d/luci-app-twofa.json $ROUTER_USER@$ROUTER_HOST:/usr/share/luci/menu.d/
@@ -52,10 +68,15 @@ $SCP_CMD root/usr/share/rpcd/acl.d/luci-app-twofa.json $ROUTER_USER@$ROUTER_HOST
 echo "Syncing Config..."
 $SCP_CMD root/etc/config/twofa $ROUTER_USER@$ROUTER_HOST:/etc/config/
 
-# 9. 应用 UCI 默认值（为 root 授予 ACL）
+# 9. 应用 UCI 默认值（为 root 授予 ACL，并修复损坏的 twofa 配置）
 echo "Applying uci-defaults..."
 $SCP_CMD root/etc/uci-defaults/10-luci-app-twofa $ROUTER_USER@$ROUTER_HOST:/etc/uci-defaults/
-$SSH_CMD "rm -f /etc/uci-defaults/98-luci-app-twofa /etc/uci-defaults/99-luci-app-twofa; [ -x /etc/uci-defaults/10-luci-app-twofa ] && /etc/uci-defaults/10-luci-app-twofa || true"
+$SCP_CMD root/etc/uci-defaults/98-luci-app-twofa $ROUTER_USER@$ROUTER_HOST:/etc/uci-defaults/
+$SCP_CMD root/etc/uci-defaults/99-luci-app-twofa $ROUTER_USER@$ROUTER_HOST:/etc/uci-defaults/
+$SSH_CMD "chmod +x /etc/uci-defaults/10-luci-app-twofa /etc/uci-defaults/98-luci-app-twofa /etc/uci-defaults/99-luci-app-twofa; \
+/etc/uci-defaults/10-luci-app-twofa; \
+/etc/uci-defaults/98-luci-app-twofa 2>/dev/null || true; \
+/etc/uci-defaults/99-luci-app-twofa 2>/dev/null || true"
 
 # 10. 重启服务
 echo "Restarting RPCD..."
