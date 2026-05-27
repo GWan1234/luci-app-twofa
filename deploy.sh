@@ -44,19 +44,38 @@ $SCP_CMD luasrc/twofa/*.lua $ROUTER_USER@$ROUTER_HOST:/usr/lib/lua/luci/twofa/
 echo "Syncing JS..."
 $SCP_CMD htdocs/luci-static/resources/preload/twofa.js $ROUTER_USER@$ROUTER_HOST:/www/luci-static/resources/preload/
 
-# 6b. 部署中文翻译（需要 po2lmo，或通过 IPK 安装获得完整 i18n）
-if command -v po2lmo >/dev/null 2>&1; then
+# 6b. 部署中文翻译
+# LuCI 的 i18n.lua 会把 lang 做 gsub('_','-'):lower() 归一化，所以无论 UCI 里是
+#   zh_Hans / zh_cn / zh-cn，最终都会查 luci-app-twofa.zh-cn.lmo 这个文件。
+# 这里也顺手再投一份 .zh-hans.lmo，照顾极少数把 lang 设成 zh_Hans 的固件。
+PO_SRC="po/zh_Hans/luci-app-twofa.po"
+
+if [ ! -f "$PO_SRC" ]; then
+	echo "跳过 i18n: 未找到 $PO_SRC"
+elif command -v po2lmo >/dev/null 2>&1; then
 	echo "Syncing i18n..."
-	for lang in zh-cn zh_Hans; do
-		po="po/${lang}/luci-app-twofa.po"
-		if [ -f "$po" ]; then
-			po2lmo "$po" "/tmp/luci-app-twofa.${lang}.lmo"
-			$SCP_CMD "/tmp/luci-app-twofa.${lang}.lmo" "$ROUTER_USER@$ROUTER_HOST:/usr/lib/lua/luci/i18n/"
-			rm -f "/tmp/luci-app-twofa.${lang}.lmo"
-		fi
+	TMP_LMO="$(mktemp -t luci-app-twofa.XXXXXX.lmo)"
+	po2lmo "$PO_SRC" "$TMP_LMO"
+	for suffix in zh-cn zh-hans; do
+		$SCP_CMD "$TMP_LMO" "$ROUTER_USER@$ROUTER_HOST:/usr/lib/lua/luci/i18n/luci-app-twofa.${suffix}.lmo"
 	done
+	rm -f "$TMP_LMO"
 else
-	echo "提示: 未找到 po2lmo，中文界面需通过 IPK 安装或手动编译 .lmo 文件"
+	echo "提示: 本机未安装 po2lmo，改用路由器侧的 po2lmo 编译 ..."
+	REMOTE_PO="/tmp/luci-app-twofa.zh_Hans.po"
+	$SCP_CMD "$PO_SRC" "$ROUTER_USER@$ROUTER_HOST:$REMOTE_PO"
+	$SSH_CMD "set -e; \
+		if command -v po2lmo >/dev/null 2>&1; then \
+			po2lmo $REMOTE_PO /usr/lib/lua/luci/i18n/luci-app-twofa.zh-cn.lmo; \
+			cp -f /usr/lib/lua/luci/i18n/luci-app-twofa.zh-cn.lmo \
+				/usr/lib/lua/luci/i18n/luci-app-twofa.zh-hans.lmo; \
+			rm -f $REMOTE_PO; \
+			echo '路由器侧已生成 luci-app-twofa.zh-cn.lmo'; \
+		else \
+			echo '错误: 路由器上也没有 po2lmo, 请先在路由器安装: opkg update && opkg install po2lmo'; \
+			rm -f $REMOTE_PO; \
+			exit 1; \
+		fi"
 fi
 
 # 7. 复制菜单与 ACL
