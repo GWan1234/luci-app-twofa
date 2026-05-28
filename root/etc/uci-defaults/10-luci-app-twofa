@@ -15,12 +15,28 @@ EOF
 }
 
 generate_secret() {
-	# Base32 secret for TOTP (16 chars, A-Z2-7). Prefer openssl, fallback to awk.
-	if command -v openssl >/dev/null 2>&1; then
-		openssl rand -base32 20 2>/dev/null | tr -d '= \n' | cut -c1-16
+	# 16-char base32 secret for TOTP.
+	#
+	# IMPORTANT: openssl rand has -hex and -base64 but NOT -base32, so the
+	# previous `openssl rand -base32 20` call returned an empty string and
+	# silently committed `secret=""` into UCI - that's how router and
+	# authenticator could end up holding *different* secrets even when the
+	# user never explicitly regenerated.
+	#
+	# Pull random bytes from /dev/urandom and let tr filter them to the
+	# base32 alphabet directly. tr is in busybox on every OpenWrt build.
+	local s
+	s="$(tr -dc 'A-Z2-7' </dev/urandom 2>/dev/null | head -c 16)"
+	if [ -n "$s" ] && [ "${#s}" -eq 16 ]; then
+		printf '%s' "$s"
 		return
 	fi
+
+	# Last-resort fallback. awk's srand() with no args seeds from the system
+	# clock in busybox awk; without it we'd produce the SAME secret on every
+	# boot, which is obviously catastrophic.
 	awk 'BEGIN {
+		srand()
 		split("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", c, "")
 		for (i = 1; i <= 16; i++)
 			printf "%s", c[int(rand() * 32) + 1]
@@ -60,8 +76,16 @@ if [ -n "$secret" ] && [ -z "$(echo "$secret" | tr -d ' \t')" ]; then
 fi
 
 if [ -z "$secret" ]; then
-	uci -q set twofa.global.secret="$(generate_secret)"
-	changed_twofa=1
+	new_secret="$(generate_secret)"
+	# Guard against generate_secret() somehow returning empty/short output -
+	# committing secret="" would brick TOTP forever because the verify path
+	# treats < 16 chars as "no secret configured".
+	if [ -n "$new_secret" ] && [ "${#new_secret}" -ge 16 ]; then
+		uci -q set twofa.global.secret="$new_secret"
+		changed_twofa=1
+	else
+		logger -t "$name" "WARN: generate_secret() returned empty; leaving twofa.global.secret unset"
+	fi
 fi
 
 [ "$changed_twofa" = "1" ] && uci -q commit twofa
