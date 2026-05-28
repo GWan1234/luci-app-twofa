@@ -40,6 +40,19 @@ local STATE_FILE  = "/var/run/luci-twofa-sessions.json"
 local STATE_TTL   = 86400
 local KEEP_SCOPES = { ubus = true, uci = true, file = true }
 
+-- ubus objects that MUST stay reachable on a downgraded session.
+--   * luci-app-twofa  - so the 2FA modal can still call status()/verify().
+--   * session         - luci.js polls `session.access` as a heartbeat; if
+--                       that RPC itself fails, LuCI immediately decides the
+--                       session expired and shows its own login modal,
+--                       hiding our 2FA modal. Session methods only inspect
+--                       ACL state, they cannot mutate router config, so
+--                       leaving them callable is safe.
+local PRESERVE_UBUS_OBJ = {
+	["luci-app-twofa"] = true,
+	["session"]        = true,
+}
+
 local function read_state()
 	local data = fs.readfile(STATE_FILE)
 	if not data or #data == 0 then
@@ -162,9 +175,7 @@ local function downgrade(sid)
 
 	local saved = {}
 	for _, it in ipairs(flatten_acls(sess.acls)) do
-		-- Always keep our own ubus object reachable so the modal can call
-		-- verify() / status() while everything else is locked down.
-		if not (it.scope == "ubus" and it.obj == "luci-app-twofa") then
+		if not (it.scope == "ubus" and PRESERVE_UBUS_OBJ[it.obj]) then
 			saved[#saved + 1] = it
 		end
 	end
