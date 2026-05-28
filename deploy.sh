@@ -48,7 +48,7 @@ echo "Syncing rpcd plugin..."
 $SCP_CMD root/usr/libexec/rpcd/luci-app-twofa "$ROUTER_USER@$ROUTER_HOST:/usr/libexec/rpcd/luci-app-twofa"
 $SSH_CMD "chmod +x /usr/libexec/rpcd/luci-app-twofa"
 
-# 6. preload JS (rpc.declare → luci.twofa.{status,verify})
+# 6. preload JS (rpc.declare → luci-app-twofa.{status,verify})
 echo "Syncing JS..."
 $SCP_CMD htdocs/luci-static/resources/preload/twofa.js "$ROUTER_USER@$ROUTER_HOST:/www/luci-static/resources/preload/"
 
@@ -111,8 +111,8 @@ cat <<EOF
 部署完成。
 
 验收步骤：
-  1. ssh 进路由器：ubus list | grep luci.twofa     -> 应能看到 luci.twofa
-  2. ssh 进路由器：ubus -v list luci.twofa         -> 应列出 status / verify 两个方法
+  1. ssh 进路由器：ubus list | grep luci-app-twofa  -> 应能看到 luci-app-twofa
+  2. ssh 进路由器：ubus -v list luci-app-twofa      -> 应列出 status / verify 两个方法
   3. 浏览器重新登录 LuCI，应弹出 2FA modal
   4. modal 弹出后，打开 DevTools Network 面板：
        - 此时随便点别的菜单, 任意 ubus 调用都应报 ACL denied (说明 rpcd 已强制下钳)

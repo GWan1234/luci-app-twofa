@@ -1,10 +1,16 @@
 #!/usr/bin/lua
--- rpcd plugin: exposes ubus object `luci.twofa` with methods `status` and
+-- rpcd plugin: exposes ubus object `luci-app-twofa` with methods `status` and
 -- `verify`. The plugin is what actually enforces 2FA: when an authenticated
 -- session does not have TOTP confirmed yet, status() revokes every
 -- non-twofa ACL on the rpcd session, so subsequent ubus calls (uci.get,
 -- network.*, etc.) are denied by rpcd itself. verify() restores the saved
 -- ACLs once the TOTP code is accepted.
+--
+-- NOTE on naming: rpcd registers each /usr/libexec/rpcd/<basename> script
+-- as a ubus object using the basename verbatim. This file is named
+-- `luci-app-twofa`, so the ubus object name is also `luci-app-twofa`,
+-- NOT `luci.twofa`. The ACL file, the JS preload and the OURSELF ACL
+-- guard below all use this exact name; do not "tidy" it.
 --
 -- Layout of /var/run/luci-twofa-sessions.json:
 --   {
@@ -158,7 +164,7 @@ local function downgrade(sid)
 	for _, it in ipairs(flatten_acls(sess.acls)) do
 		-- Always keep our own ubus object reachable so the modal can call
 		-- verify() / status() while everything else is locked down.
-		if not (it.scope == "ubus" and it.obj == "luci.twofa") then
+		if not (it.scope == "ubus" and it.obj == "luci-app-twofa") then
 			saved[#saved + 1] = it
 		end
 	end

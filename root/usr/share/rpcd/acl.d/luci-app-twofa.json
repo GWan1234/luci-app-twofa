@@ -1,9 +1,9 @@
 {
 	"luci-app-twofa": {
-		"description": "Grants access to the 2FA settings page and the luci.twofa ubus object. Must be attached to every login that is required to satisfy 2FA.",
+		"description": "Grants access to the 2FA settings page and the luci-app-twofa ubus object. Must be attached to every login that is required to satisfy 2FA.",
 		"read": {
 			"ubus": {
-				"luci.twofa": [ "status", "verify" ]
+				"luci-app-twofa": [ "status", "verify" ]
 			},
 			"file": {
 				"/etc/config/twofa": [ "read" ],
@@ -13,7 +13,7 @@
 		},
 		"write": {
 			"ubus": {
-				"luci.twofa": [ "status", "verify" ]
+				"luci-app-twofa": [ "status", "verify" ]
 			},
 			"file": {
 				"/etc/config/twofa": [ "write" ],

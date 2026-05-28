@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-twofa
 PKG_VERSION:=1.0
-PKG_RELEASE:=6
+PKG_RELEASE:=7
 
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=YourName
@@ -32,7 +32,8 @@ if [ -f /usr/lib/lua/luci/i18n/luci-app-twofa.zh-cn.lmo ] && \
 fi
 
 # 2) rpcd: restart so the new /usr/libexec/rpcd/luci-app-twofa is enumerated
-#    and the luci.twofa ubus object becomes resolvable.
+#    and the luci-app-twofa ubus object becomes resolvable
+#    (rpcd derives the object name from the script's basename verbatim).
 /etc/init.d/rpcd enable >/dev/null 2>&1 || true
 /etc/init.d/rpcd restart >/dev/null 2>&1 || true
 

@@ -5,14 +5,20 @@
 
 var POLL_INTERVAL = 30000;
 
+// IMPORTANT: rpcd registers each /usr/libexec/rpcd/<basename> script as a ubus
+// object using the *basename* verbatim. Our plugin lives at
+// /usr/libexec/rpcd/luci-app-twofa, so the ubus object is `luci-app-twofa`,
+// NOT `luci.twofa`. Don't "tidy" this string.
+var TWOFA_OBJECT = 'luci-app-twofa';
+
 var callStatus = rpc.declare({
-	object: 'luci.twofa',
+	object: TWOFA_OBJECT,
 	method: 'status',
 	expect: { '': {} }
 });
 
 var callVerify = rpc.declare({
-	object: 'luci.twofa',
+	object: TWOFA_OBJECT,
 	method: 'verify',
 	params: [ 'token' ],
 	expect: { '': {} }

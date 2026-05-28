@@ -6,9 +6,10 @@ module("luci.controller.admin.system.twofa", package.seeall)
 --
 -- All status / verify endpoints have moved to the rpcd plugin
 -- (/usr/libexec/rpcd/luci-app-twofa) which exposes them as the
--- `luci.twofa` ubus object. That gives rpcd-level enforcement: when a
--- session has not yet satisfied TOTP, the plugin revokes every non-twofa
--- ACL on the session so ubus uci.get / network.* / etc. are denied.
+-- `luci-app-twofa` ubus object (rpcd uses the file basename verbatim).
+-- That gives rpcd-level enforcement: when a session has not yet satisfied
+-- TOTP, the plugin revokes every non-twofa ACL on the session so subsequent
+-- ubus uci.get / network.* / etc. are denied.
 
 function index()
 	entry({ "admin", "services", "twofa" },
