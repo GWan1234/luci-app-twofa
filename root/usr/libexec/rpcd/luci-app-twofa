@@ -256,6 +256,12 @@ local function method_verify(args)
 		return { success = false, error = "totp_module_missing" }
 	end
 
+	-- Surface which HMAC backend we landed on. Logged once per verify call
+	-- (cheap) so logread immediately tells us if we're on the pure-lua path
+	-- because the firmware's libnixio lacks OpenSSL.
+	log(string.format("verify [%s]: hmac_backend=%s",
+		sid_tag, tostring(totp._hmac_backend or "unknown")))
+
 	local secret = uci_get("twofa", "global", "secret")
 	if not secret or #secret < 16 then
 		log(string.format("verify denied [%s]: no_secret (got=%q)",
