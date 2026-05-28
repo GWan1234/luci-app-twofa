@@ -17,10 +17,18 @@
 --     }
 --   }
 
+-- Defer optional requires so that `list` always succeeds even on minimal
+-- firmwares where luci-compat / nixio variants live in non-default paths.
 local json = require "luci.jsonc"
 local fs   = require "nixio.fs"
-local uci  = require "luci.model.uci".cursor()
-local totp = require "luci.twofa.totp"
+
+local function safe_require(mod)
+	local ok, m = pcall(require, mod)
+	if ok then return m end
+	return nil
+end
+
+local totp = safe_require("luci.twofa.totp")
 
 local STATE_FILE  = "/var/run/luci-twofa-sessions.json"
 local STATE_TTL   = 86400
@@ -70,12 +78,26 @@ local function ubus_call(object, method, args)
 	return (type(parsed) == "table") and parsed or nil
 end
 
+local function uci_get(config, section, option)
+	-- Shell out to uci instead of `require "luci.model.uci"` so the plugin
+	-- works even when luci-compat is missing or relocates the module.
+	local p = io.popen(string.format(
+		"uci -q get %s.%s.%s 2>/dev/null",
+		config, section, option
+	))
+	if not p then return nil end
+	local v = p:read("*l")
+	p:close()
+	if v == nil or v == "" then return nil end
+	return v
+end
+
 local function is_enabled()
-	return uci:get("twofa", "global", "enabled") == "1"
+	return uci_get("twofa", "global", "enabled") == "1"
 end
 
 local function is_configured()
-	local s = uci:get("twofa", "global", "secret")
+	local s = uci_get("twofa", "global", "secret")
 	return type(s) == "string" and #s >= 16
 end
 
@@ -200,7 +222,10 @@ local function method_verify(args)
 		return { success = true }
 	end
 
-	local secret = uci:get("twofa", "global", "secret")
+	if not totp then
+		return { success = false, error = "totp_module_missing" }
+	end
+	local secret = uci_get("twofa", "global", "secret")
 	if not secret or not totp.verify(secret, token) then
 		return { success = false, error = "invalid_token" }
 	end

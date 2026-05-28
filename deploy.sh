@@ -53,9 +53,21 @@ echo "Syncing JS..."
 $SCP_CMD htdocs/luci-static/resources/preload/twofa.js "$ROUTER_USER@$ROUTER_HOST:/www/luci-static/resources/preload/"
 
 # 6b. 部署中文翻译
-# LuCI 的 i18n.lua 会把 lang 做 gsub('_','-'):lower() 归一化，所以无论 UCI 里是
-#   zh_Hans / zh_cn / zh-cn，最终都会查 luci-app-twofa.zh-cn.lmo 这个文件。
-# 这里也顺手再投一份 .zh-hans.lmo，照顾极少数把 lang 设成 zh_Hans 的固件。
+#
+# 注意:
+#   - po2lmo 是 luci-base 编译期的 host 工具, opkg 源里不存在,
+#     在路由器上跑 `opkg install po2lmo` 一定失败, 别再走那个套路.
+#   - 在 Mac/Linux 本机装 po2lmo 的方法:
+#       git clone --depth 1 https://github.com/openwrt/luci.git /tmp/luci
+#       cd /tmp/luci/build && cc -O2 -o po2lmo po2lmo.c contrib/lmo.c contrib/template_lmo.c
+#       sudo install -m 0755 po2lmo /usr/local/bin/
+#   - 用 GitHub Actions 出来的 ipk 已经把 .lmo 打进包里, 走 ipk 路径不用管这一段.
+#
+# LuCI 的 i18n.load() 会把 lang 做 gsub('_','-'):lower() 归一化, 所以:
+#   uci.luci.main.lang = zh_Hans  ->  zh-hans  -> 命中 luci-app-twofa.zh-hans.lmo
+#   uci.luci.main.lang = zh_cn    ->  zh-cn    -> 命中 luci-app-twofa.zh-cn.lmo
+# 两份 .lmo 内容相同, 我们直接 cp 一份.
+
 PO_SRC="po/zh_Hans/luci-app-twofa.po"
 
 if [ ! -f "$PO_SRC" ]; then
@@ -69,21 +81,8 @@ elif command -v po2lmo >/dev/null 2>&1; then
 	done
 	rm -f "$TMP_LMO"
 else
-	echo "提示: 本机未安装 po2lmo，改用路由器侧的 po2lmo 编译 ..."
-	REMOTE_PO="/tmp/luci-app-twofa.zh_Hans.po"
-	$SCP_CMD "$PO_SRC" "$ROUTER_USER@$ROUTER_HOST:$REMOTE_PO"
-	$SSH_CMD "set -e; \
-		if command -v po2lmo >/dev/null 2>&1; then \
-			po2lmo $REMOTE_PO /usr/lib/lua/luci/i18n/luci-app-twofa.zh-cn.lmo; \
-			cp -f /usr/lib/lua/luci/i18n/luci-app-twofa.zh-cn.lmo \
-				/usr/lib/lua/luci/i18n/luci-app-twofa.zh-hans.lmo; \
-			rm -f $REMOTE_PO; \
-			echo '路由器侧已生成 luci-app-twofa.zh-cn.lmo'; \
-		else \
-			echo '错误: 路由器上也没有 po2lmo, 请先在路由器安装: opkg update && opkg install po2lmo'; \
-			rm -f $REMOTE_PO; \
-			exit 1; \
-		fi"
+	echo "跳过 i18n: 本机未安装 po2lmo, 中文文案可能不显示."
+	echo "        如需在 deploy.sh 路径下也启用中文, 请按脚本注释装一份 po2lmo."
 fi
 
 # 7. 菜单 + ACL (ACL 已重写, 见 root/usr/share/rpcd/acl.d/luci-app-twofa.json)
