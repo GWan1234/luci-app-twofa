@@ -63,11 +63,17 @@ msgstr "请输入验证器中的 6 位动态验证码以继续。"
 msgid "Invalid format"
 msgstr "格式无效"
 
+msgid "Please enter a 6-digit code"
+msgstr "请输入 6 位验证码"
+
 msgid "Verifying..."
 msgstr "正在验证…"
 
 msgid "Invalid verification code"
 msgstr "验证码错误"
+
+msgid "Verification failed, please try again"
+msgstr "验证失败，请重试"
 
 msgid "Verify"
 msgstr "验证"

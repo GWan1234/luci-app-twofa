@@ -1,22 +1,25 @@
 {
-    "luci-app-twofa": {
-        "description": "Grant access to 2FA settings",
-        "read": {
-            "cgi-io": [ "download", "upload" ],
-            "file": {
-                "/etc/config/twofa": [ "read" ],
-                "/usr/lib/lua/luci/twofa/*": [ "read" ],
-                "/www/luci-static/resources/preload/twofa.js": [ "read" ],
-                "/var/run/luci-twofa-sessions.json": [ "read", "write" ]
-            },
-            "uci": [ "twofa" ]
-        },
-        "write": {
-            "file": {
-                "/etc/config/twofa": [ "write" ],
-                "/var/run/luci-twofa-sessions.json": [ "write" ]
-            },
-            "uci": [ "twofa" ]
-        }
-    }
+	"luci-app-twofa": {
+		"description": "Grants access to the 2FA settings page and the luci.twofa ubus object. Must be attached to every login that is required to satisfy 2FA.",
+		"read": {
+			"ubus": {
+				"luci.twofa": [ "status", "verify" ]
+			},
+			"file": {
+				"/etc/config/twofa": [ "read" ],
+				"/var/run/luci-twofa-sessions.json": [ "read" ]
+			},
+			"uci": [ "twofa" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.twofa": [ "status", "verify" ]
+			},
+			"file": {
+				"/etc/config/twofa": [ "write" ],
+				"/var/run/luci-twofa-sessions.json": [ "write" ]
+			},
+			"uci": [ "twofa" ]
+		}
+	}
 }

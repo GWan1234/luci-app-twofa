@@ -1,0 +1,259 @@
+#!/usr/bin/lua
+-- rpcd plugin: exposes ubus object `luci.twofa` with methods `status` and
+-- `verify`. The plugin is what actually enforces 2FA: when an authenticated
+-- session does not have TOTP confirmed yet, status() revokes every
+-- non-twofa ACL on the rpcd session, so subsequent ubus calls (uci.get,
+-- network.*, etc.) are denied by rpcd itself. verify() restores the saved
+-- ACLs once the TOTP code is accepted.
+--
+-- Layout of /var/run/luci-twofa-sessions.json:
+--   {
+--     "sessions": {
+--       "<rpc_session_id>": {
+--         "verified":   true|false,
+--         "saved_acls": [ { "scope":"ubus", "obj":"uci", "fn":"get" }, ... ],
+--         "expires":    <unix_ts>
+--       }
+--     }
+--   }
+
+local json = require "luci.jsonc"
+local fs   = require "nixio.fs"
+local uci  = require "luci.model.uci".cursor()
+local totp = require "luci.twofa.totp"
+
+local STATE_FILE  = "/var/run/luci-twofa-sessions.json"
+local STATE_TTL   = 86400
+local KEEP_SCOPES = { ubus = true, uci = true, file = true }
+
+local function read_state()
+	local data = fs.readfile(STATE_FILE)
+	if not data or #data == 0 then
+		return { sessions = {} }
+	end
+	local ok = json.parse(data)
+	if type(ok) ~= "table" then
+		return { sessions = {} }
+	end
+	ok.sessions = ok.sessions or {}
+	return ok
+end
+
+local function write_state(state)
+	state = state or { sessions = {} }
+	local now = os.time()
+	for sid, info in pairs(state.sessions or {}) do
+		if type(info) ~= "table" or (info.expires and info.expires < now) then
+			state.sessions[sid] = nil
+		end
+	end
+	fs.writefile(STATE_FILE, json.stringify(state))
+	pcall(fs.chmod, STATE_FILE, tonumber("600", 8))
+end
+
+local function shell_quote(s)
+	return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
+end
+
+local function ubus_call(object, method, args)
+	local payload = json.stringify(args or {})
+	local cmd = string.format(
+		"ubus call %s %s %s 2>/dev/null",
+		object, method, shell_quote(payload)
+	)
+	local p = io.popen(cmd)
+	if not p then return nil end
+	local out = p:read("*a") or ""
+	p:close()
+	if out == "" then return nil end
+	local parsed = json.parse(out)
+	return (type(parsed) == "table") and parsed or nil
+end
+
+local function is_enabled()
+	return uci:get("twofa", "global", "enabled") == "1"
+end
+
+local function is_configured()
+	local s = uci:get("twofa", "global", "secret")
+	return type(s) == "string" and #s >= 16
+end
+
+local function flatten_acls(acls)
+	local out = {}
+	if type(acls) ~= "table" then return out end
+	for scope, scope_data in pairs(acls) do
+		if KEEP_SCOPES[scope] and type(scope_data) == "table" then
+			for obj, funcs in pairs(scope_data) do
+				if type(funcs) == "table" then
+					for _, fn in ipairs(funcs) do
+						out[#out + 1] = { scope = scope, obj = obj, fn = fn }
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
+local function apply_acl_op(verb, sid, items)
+	if not items or #items == 0 then return end
+	local by_scope = {}
+	for _, it in ipairs(items) do
+		by_scope[it.scope] = by_scope[it.scope] or {}
+		table.insert(by_scope[it.scope], { it.obj, it.fn })
+	end
+	for scope, objects in pairs(by_scope) do
+		ubus_call("session", verb, {
+			ubus_rpc_session = sid,
+			scope            = scope,
+			objects          = objects,
+		})
+	end
+end
+
+local function downgrade(sid)
+	if not sid or sid == "" then return end
+
+	local state = read_state()
+	local cur   = state.sessions[sid]
+	if cur and cur.verified ~= true and type(cur.saved_acls) == "table"
+	   and #cur.saved_acls > 0 then
+		-- Already downgraded; just refresh expiry and re-apply to cover the
+		-- case where rpcd was restarted and lost the in-memory revocations.
+		cur.expires = os.time() + STATE_TTL
+		write_state(state)
+		apply_acl_op("revoke", sid, cur.saved_acls)
+		return
+	end
+
+	local sess = ubus_call("session", "list", { ubus_rpc_session = sid })
+	if not sess or type(sess.acls) ~= "table" then
+		return
+	end
+
+	local saved = {}
+	for _, it in ipairs(flatten_acls(sess.acls)) do
+		-- Always keep our own ubus object reachable so the modal can call
+		-- verify() / status() while everything else is locked down.
+		if not (it.scope == "ubus" and it.obj == "luci.twofa") then
+			saved[#saved + 1] = it
+		end
+	end
+
+	state.sessions[sid] = {
+		verified   = false,
+		saved_acls = saved,
+		expires    = os.time() + STATE_TTL,
+	}
+	write_state(state)
+	apply_acl_op("revoke", sid, saved)
+end
+
+local function restore(sid)
+	if not sid or sid == "" then return false end
+	local state = read_state()
+	local cur   = state.sessions[sid] or {}
+	if type(cur.saved_acls) == "table" then
+		apply_acl_op("grant", sid, cur.saved_acls)
+	end
+	state.sessions[sid] = {
+		verified   = true,
+		saved_acls = nil,
+		expires    = os.time() + STATE_TTL,
+	}
+	write_state(state)
+	return true
+end
+
+local function method_status(args)
+	local sid        = args.ubus_rpc_session
+	local enabled    = is_enabled()
+	local configured = is_configured()
+
+	local state      = read_state()
+	local sess_state = state.sessions[sid or ""] or {}
+	local verified   = sess_state.verified == true
+
+	if enabled and configured and sid and not verified then
+		downgrade(sid)
+	end
+
+	return {
+		enabled    = enabled,
+		configured = configured,
+		verified   = (not enabled) or verified,
+	}
+end
+
+local function method_verify(args)
+	local sid   = args.ubus_rpc_session
+	local token = tostring(args.token or ""):gsub("%s+", "")
+
+	if not sid or sid == "" then
+		return { success = false, error = "no_session" }
+	end
+	if not token:match("^%d%d%d%d%d%d$") then
+		return { success = false, error = "bad_format" }
+	end
+	if not is_enabled() then
+		return { success = true }
+	end
+
+	local secret = uci:get("twofa", "global", "secret")
+	if not secret or not totp.verify(secret, token) then
+		return { success = false, error = "invalid_token" }
+	end
+
+	restore(sid)
+	return { success = true }
+end
+
+local methods = {
+	status = { args = {},               call = method_status },
+	verify = { args = { token = "" },   call = method_verify },
+}
+
+local function json_string(s)
+	-- minimal JSON string escape; method names + arg keys are ASCII identifiers
+	-- so we only need to handle the basics.
+	return '"' .. tostring(s):gsub('\\', '\\\\'):gsub('"', '\\"') .. '"'
+end
+
+local cmd = arg[1]
+
+if cmd == "list" then
+	-- Hand-roll the JSON: luci.jsonc serialises an empty Lua table as `[]`,
+	-- but rpcd expects each method definition to be an OBJECT (`{}`), even
+	-- when it takes no arguments.
+	local entries = {}
+	for name, def in pairs(methods) do
+		local arg_parts = {}
+		for k, v in pairs(def.args or {}) do
+			arg_parts[#arg_parts + 1] = json_string(k) .. ":" .. json_string(v)
+		end
+		entries[#entries + 1] = json_string(name)
+			.. ":{" .. table.concat(arg_parts, ",") .. "}"
+	end
+	io.write("{" .. table.concat(entries, ",") .. "}")
+elseif cmd == "call" then
+	local name = arg[2]
+	local m    = methods[name]
+	if not m then
+		io.write('{"error":"unknown_method"}')
+		os.exit(1)
+	end
+
+	local raw   = io.read("*a") or "{}"
+	local input = json.parse(raw)
+	if type(input) ~= "table" then input = {} end
+
+	local ok, res = pcall(m.call, input)
+	if not ok then
+		io.stderr:write("luci-app-twofa rpcd: " .. tostring(res) .. "\n")
+		io.write('{"error":"internal"}')
+		os.exit(1)
+	end
+
+	io.write(json.stringify(res or {}))
+end

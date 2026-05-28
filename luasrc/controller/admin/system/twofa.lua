@@ -1,28 +1,17 @@
 module("luci.controller.admin.system.twofa", package.seeall)
 
-require "luci.twofa.auth"
+-- Menu entry is also defined in /usr/share/luci/menu.d/luci-app-twofa.json so
+-- that the modern client-side dispatcher can pick it up. The Lua entry below
+-- is kept so legacy code paths that look up the controller don't 404.
+--
+-- All status / verify endpoints have moved to the rpcd plugin
+-- (/usr/libexec/rpcd/luci-app-twofa) which exposes them as the
+-- `luci.twofa` ubus object. That gives rpcd-level enforcement: when a
+-- session has not yet satisfied TOTP, the plugin revokes every non-twofa
+-- ACL on the session so ubus uci.get / network.* / etc. are denied.
 
 function index()
-	entry({"admin", "services", "twofa"}, cbi("admin_system/twofa"), _("2FA Settings"), 99)
-	entry({"admin", "services", "twofa", "status"}, call("action_status")).leaf = true
-	entry({"admin", "services", "twofa", "verify"}, call("action_verify")).leaf = true
-end
-
-function action_status()
-	local auth = require "luci.twofa.auth"
-	local sid = auth.get_session_id()
-	luci.http.prepare_content("application/json")
-	luci.http.write_json({
-		enabled = auth.is_enabled(),
-		verified = auth.is_verified(sid)
-	})
-end
-
-function action_verify()
-	local auth = require "luci.twofa.auth"
-	local json = require "luci.jsonc"
-	local val = json.parse(luci.http.read_content() or "{}")
-	local sid = auth.get_session_id()
-	luci.http.prepare_content("application/json")
-	luci.http.write_json({ success = auth.verify_token(sid, val.token) })
+	entry({ "admin", "services", "twofa" },
+		cbi("admin_system/twofa"),
+		_("2FA Settings"), 99)
 end

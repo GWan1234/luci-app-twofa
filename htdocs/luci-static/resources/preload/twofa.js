@@ -1,81 +1,48 @@
 'use strict';
 'require baseclass';
-'require request';
 'require rpc';
 'require ui';
 
-var ALLOW_PREFIX = '/admin/services/twofa/';
-var POLL_INTERVAL = 15000;
+var POLL_INTERVAL = 30000;
 
-function isAllowedUrl(url) {
-	if (!url) return false;
-	return String(url).indexOf(ALLOW_PREFIX) !== -1;
-}
+var callStatus = rpc.declare({
+	object: 'luci.twofa',
+	method: 'status',
+	expect: { '': {} }
+});
 
-function safeJson(res) {
-	if (!res) return null;
-	try { return (typeof res.json === 'function') ? res.json() : null; }
-	catch (_e) { return null; }
-}
+var callVerify = rpc.declare({
+	object: 'luci.twofa',
+	method: 'verify',
+	params: [ 'token' ],
+	expect: { '': {} }
+});
 
 return baseclass.extend({
 	__init__: function() {
 		var self = this;
-
+		self.modal = null;
 		self.enabled = false;
 		self.verified = true;
 
-		if (request && typeof request.addInterceptor === 'function') {
-			request.addInterceptor(function(res) {
-				if (!self.enabled || self.verified) return res;
-				var url = (res && res.url) ? res.url : '';
-				if (isAllowedUrl(url)) return res;
-				return Promise.reject(new Error('2FA Required'));
-			});
-		}
-
-		if (rpc && typeof rpc.addInterceptor === 'function') {
-			rpc.addInterceptor(function(msg, req) {
-				if (!self.enabled || self.verified) return msg;
-				var url = (req && req.xhr && req.xhr.responseURL) ? req.xhr.responseURL : '';
-				if (isAllowedUrl(url)) return msg;
-				return Promise.reject(new Error('2FA Required'));
-			});
-		}
-
-		self.checkStatus();
-		setInterval(function() { self.checkStatus(); }, POLL_INTERVAL);
+		try { self.refresh(); } catch (_e) {}
+		setInterval(function() {
+			try { self.refresh(); } catch (_e) {}
+		}, POLL_INTERVAL);
 	},
 
-	httpGet: function(path) {
-		if (request && typeof request.get === 'function') {
-			return request.get(L.url(path), { cache: false });
-		}
-		return L.get(L.url(path));
-	},
-
-	httpPost: function(path, body) {
-		if (request && typeof request.post === 'function') {
-			return request.post(L.url(path), body);
-		}
-		return L.post(L.url(path), body);
-	},
-
-	checkStatus: function() {
+	refresh: function() {
 		var self = this;
-		self.httpGet('admin/services/twofa/status').then(function(res) {
-			var status = safeJson(res);
-			if (status && status.enabled) {
-				self.enabled = true;
-				self.verified = !!status.verified;
-				if (!self.verified) self.showModal();
-				else self.hideModal();
+		return callStatus().then(function(s) {
+			s = s || {};
+			self.enabled  = !!s.enabled;
+			self.verified = !!s.verified;
+			if (self.enabled && !self.verified) {
+				self.showModal();
 			} else {
-				self.enabled = false;
-				self.verified = true;
 				self.hideModal();
 			}
-		}).catch(function() { /* swallow */ });
+		}).catch(function() { /* rpcd not ready yet; try again on next tick */ });
 	},
 
 	hideModal: function() {
@@ -100,32 +67,41 @@ return baseclass.extend({
 			'style': 'font-size:24px;text-align:center;letter-spacing:5px;width:100%;'
 		});
 
-		var errorMsg = E('div', { 'style': 'color:#ff4444;margin-top:10px;min-height:20px;' });
+		var errorMsg = E('div', {
+			'style': 'color:#ff4444;margin-top:10px;min-height:20px;'
+		});
 
-		var btn = E('button', {
-			'class': 'btn cbi-button-action',
-			'click': function() {
-				var code = (input.value || '').replace(/\s+/g, '');
-				if (!/^\d{6}$/.test(code)) {
-					errorMsg.innerText = _('Invalid format');
-					return;
-				}
-				errorMsg.innerText = _('Verifying...');
-				self.httpPost('admin/services/twofa/verify', { token: code }).then(function(res) {
-					var data = safeJson(res);
-					if (data && data.success) {
-						self.verified = true;
-						self.hideModal();
-						location.reload();
-					} else {
-						errorMsg.innerText = _('Invalid verification code');
-						input.value = '';
-						input.focus();
-					}
-				}).catch(function() {
-					errorMsg.innerText = _('Invalid verification code');
-				});
+		var btn;
+		var submit = function() {
+			var code = (input.value || '').replace(/\s+/g, '');
+			if (!/^\d{6}$/.test(code)) {
+				errorMsg.innerText = _('Please enter a 6-digit code');
+				return;
 			}
+			btn.disabled = true;
+			errorMsg.innerText = _('Verifying...');
+
+			callVerify(code).then(function(res) {
+				btn.disabled = false;
+				if (res && res.success) {
+					self.verified = true;
+					self.hideModal();
+					window.location.reload();
+				} else {
+					errorMsg.innerText = _('Invalid verification code');
+					input.value = '';
+					input.focus();
+				}
+			}).catch(function() {
+				btn.disabled = false;
+				errorMsg.innerText = _('Verification failed, please try again');
+				input.focus();
+			});
+		};
+
+		btn = E('button', {
+			'class': 'btn cbi-button-action',
+			'click': submit
 		}, _('Verify'));
 
 		this.modal = ui.showModal(_('Two-Factor Authentication'), [
@@ -136,12 +112,13 @@ return baseclass.extend({
 		]);
 
 		document.body.style.overflow = 'hidden';
-		input.focus();
+
+		try { input.focus(); } catch (_e) {}
 
 		input.addEventListener('keypress', function(e) {
 			if (e.key === 'Enter') {
 				e.preventDefault();
-				btn.click();
+				submit();
 			}
 		});
 	}
