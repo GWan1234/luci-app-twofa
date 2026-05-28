@@ -82,6 +82,12 @@ local function shell_quote(s)
 	return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
 end
 
+local function log(msg)
+	-- Mirror to syslog so `logread -e luci-app-twofa` shows what verify is doing.
+	-- Cheap enough to leave on permanently.
+	os.execute("logger -t luci-app-twofa " .. shell_quote(tostring(msg)))
+end
+
 local function ubus_call(object, method, args)
 	local payload = json.stringify(args or {})
 	local cmd = string.format(
@@ -226,28 +232,55 @@ local function method_status(args)
 end
 
 local function method_verify(args)
-	local sid   = args.ubus_rpc_session
-	local token = tostring(args.token or ""):gsub("%s+", "")
+	local sid    = args.ubus_rpc_session
+	local raw    = tostring(args.token or "")
+	local token  = (raw:gsub("%s+", ""))
+	local sid_tag = (sid and #sid > 0) and sid:sub(1, 8) or "?"
 
 	if not sid or sid == "" then
+		log("verify denied: no_session")
 		return { success = false, error = "no_session" }
 	end
 	if not token:match("^%d%d%d%d%d%d$") then
+		log(string.format("verify denied [%s]: bad_format raw_len=%d clean=%q",
+			sid_tag, #raw, token))
 		return { success = false, error = "bad_format" }
 	end
 	if not is_enabled() then
+		log(string.format("verify allowed [%s]: 2fa disabled", sid_tag))
 		return { success = true }
 	end
 
 	if not totp then
+		log(string.format("verify denied [%s]: totp_module_missing", sid_tag))
 		return { success = false, error = "totp_module_missing" }
 	end
+
 	local secret = uci_get("twofa", "global", "secret")
-	if not secret or not totp.verify(secret, token) then
-		return { success = false, error = "invalid_token" }
+	if not secret or #secret < 16 then
+		log(string.format("verify denied [%s]: no_secret (got=%q)",
+			sid_tag, tostring(secret)))
+		return { success = false, error = "no_secret" }
+	end
+
+	-- Run totp.verify in pcall so a crypto exception doesn't become a
+	-- generic "internal" error masking the real cause.
+	local ok, matched = pcall(totp.verify, secret, token)
+	if not ok then
+		log(string.format("verify crashed [%s]: %s", sid_tag, tostring(matched)))
+		return { success = false, error = "totp_exception", detail = tostring(matched) }
+	end
+
+	if not matched then
+		log(string.format(
+			"verify denied [%s]: totp_mismatch token=%s secret_len=%d unix=%d slot=%d",
+			sid_tag, token, #secret, os.time(), math.floor(os.time() / 30)
+		))
+		return { success = false, error = "totp_mismatch" }
 	end
 
 	restore(sid)
+	log(string.format("verify ok [%s]: session restored", sid_tag))
 	return { success = true }
 end
 

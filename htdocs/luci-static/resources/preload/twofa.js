@@ -93,14 +93,19 @@ return baseclass.extend({
 					self.verified = true;
 					self.hideModal();
 					window.location.reload();
-				} else {
-					errorMsg.innerText = _('Invalid verification code');
-					input.value = '';
-					input.focus();
+					return;
 				}
-			}).catch(function() {
+				// Surface the server-side error code so users (and we) can
+				// tell `totp_mismatch` from `no_secret` / `totp_exception`
+				// without having to grep syslog every time.
+				var why = (res && res.error) ? (' [' + res.error + ']') : '';
+				errorMsg.innerText = _('Invalid verification code') + why;
+				input.value = '';
+				input.focus();
+			}).catch(function(err) {
 				btn.disabled = false;
-				errorMsg.innerText = _('Verification failed, please try again');
+				var msg = (err && err.message) ? (' [' + err.message + ']') : '';
+				errorMsg.innerText = _('Verification failed, please try again') + msg;
 				input.focus();
 			});
 		};
