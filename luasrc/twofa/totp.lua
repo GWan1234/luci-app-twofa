@@ -27,9 +27,26 @@ end
 assert(bit and bit.band and bit.bor and bit.bxor,
 	"totp: no bit module available (need nixio.bit, bit, or bit32)")
 
-local band = bit.band
-local bor  = bit.bor
-local bxor = bit.bxor
+-- IMPORTANT: nixio.bit on Lua 5.1 (which OpenWrt / ImmortalWrt ships) returns
+-- *signed* int32 results - bxor(0x12345678, 0x9ABCDEF0) comes back as
+-- -2003391608 instead of 0x88898988 because lua_pushinteger boxes it through
+-- a signed lua_Integer. The rest of this module does plain arithmetic on
+-- those values (rol uses math.floor/division, additions assume non-negative)
+-- and silently produces garbage when fed negatives - that's the exact bug
+-- that made every RFC 6238 vector fail with a different wrong code.
+--
+-- Wrap every bit op to normalise the result back into [0, 2^32). LuaBitOp,
+-- bit32, and nixio.bit on Lua 5.3+ all happen to already return unsigned
+-- values, so the wrappers are no-ops there; the cost is one comparison.
+local function uint32(x)
+	if x < 0 then return x + 0x100000000 end
+	return x
+end
+
+local raw_band, raw_bor, raw_bxor = bit.band, bit.bor, bit.bxor
+local function band(a, b) return uint32(raw_band(a, b)) end
+local function bor (a, b) return uint32(raw_bor (a, b)) end
+local function bxor(a, b) return uint32(raw_bxor(a, b)) end
 
 local M = {}
 
