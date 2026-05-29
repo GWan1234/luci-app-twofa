@@ -1,4 +1,4 @@
-# Changelog
+  # Changelog
 
 All notable changes to `luci-app-twofa` are documented here.
 
@@ -30,6 +30,15 @@ section verbatim and pastes it as the release body.
 
 ### Added
 - `CHANGELOG.md` (this file). Tagged releases pull their notes from here.
+
+### Fixed
+- Language pack ipk filename used to be `luci-i18n-twofa-zh-cn_0_<arch>.ipk`
+  (version literally `0`) because luci.mk's i18n package template pulls its
+  version from `PKG_PO_VERSION`, whose default is a `git log` invocation on
+  `po/` - and our CI copies the source into the SDK without a `.git` dir,
+  so the lookup returns empty. Explicitly setting `PKG_PO_VERSION` in the
+  Makefile so all four ipks of a release share the same `1.0-r15` version
+  string.
 
 ## [1.0-r14] - 2026-05-29
 

@@ -4,6 +4,16 @@ PKG_NAME:=luci-app-twofa
 PKG_VERSION:=1.0
 PKG_RELEASE:=15
 
+# luci.mk auto-generates luci-i18n-<name>-<lang> packages whose VERSION is
+# pulled from PKG_PO_VERSION (default: $(call findrev) on po/ via git log).
+# Our CI copies the source into the SDK without a .git dir, so findrev
+# returns empty and i18n ipks come out as `luci-i18n-twofa-zh-cn_0_<arch>.ipk`.
+# Tie PKG_PO_VERSION to the main package's version so all four ipks of a
+# release share `1.0-r15` (or whatever PKG_VERSION-rPKG_RELEASE evaluates to).
+# Must be assigned BEFORE include luci.mk - luci.mk uses ?= so it loses to
+# any prior assignment.
+PKG_PO_VERSION:=$(PKG_VERSION)-r$(PKG_RELEASE)
+
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=YourName
 
