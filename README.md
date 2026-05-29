@@ -5,7 +5,25 @@ Two-Factor Authentication (TOTP, RFC 6238) for the OpenWrt / ImmortalWrt LuCI we
 - Works with Google Authenticator, Microsoft Authenticator, Authy, etc.
 - Configurable from LuCI **Services → 2FA Settings**.
 - Enforced at the **rpcd ACL layer**, not the page layer — the modal cannot be bypassed by knowing a direct URL or by calling ubus directly.
+- A persistent guard daemon (`luci-app-twofa-guard`) makes the rpcd downgrade kick in for non-browser API clients (`curl`, `python-requests`, raw `ubus`) too, not just for browsers — at most ~1 s window after login.
 - English by default; Simplified Chinese available as a separate language pack.
+
+## Threat model & scope
+
+What this package **does** protect:
+
+- The LuCI web UI: cannot perform any action until the TOTP modal is satisfied for the session.
+- The rpcd JSON-RPC and ubus over HTTP surface used by LuCI: ACLs are revoked on every authenticated-but-not-yet-verified session within ~1 s of login. `curl`-style API clients are forced through the same gate as browser users.
+- The TOTP secret at rest: stored in `/etc/twofa.secret` (mode 0600, root-only), **not** in `/etc/config/twofa` (which is world-readable and ships in sysupgrade backups).
+- Brute force: 5 failed verifies trigger a 60 s lockout, doubling each engagement up to 30 min.
+- Replay: every accepted code increments a per-session counter; the same or older slot cannot be reused.
+
+What this package **does NOT** protect:
+
+- **ssh / dropbear.** Anyone with the root ssh password can already do anything, including disable 2FA. If 2FA matters, you should be using key-only ssh or disabling password ssh altogether.
+- **Physical / serial console access.** Same reasoning.
+- **uhttpd / nginx over plain HTTP.** If LuCI is exposed without TLS, the TOTP secret (during setup) and per-call session ids travel in cleartext. Always terminate TLS in front of LuCI.
+- **A compromised root account on the router itself.** Root can read `/etc/twofa.secret` and `/var/run/luci-twofa-sessions.json` directly. This is by definition; 2FA cannot defend against an attacker who already has root.
 
 ## Compatibility
 
