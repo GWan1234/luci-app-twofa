@@ -71,20 +71,54 @@ jobs:
           cd "$GITHUB_WORKSPACE/sdk"
           rm -rf tmp
           make package/symlinks
-          echo "CONFIG_PACKAGE_luci-app-twofa=m" >> .config
+
+          # luci.mk auto-generates a separate luci-i18n-twofa-<lang> package
+          # for every po/<lang>/ subdir, but the SDK only builds packages
+          # that are explicitly enabled in .config. Enable both the main
+          # package and every i18n variant we ship po/ sources for.
+          {
+            echo "CONFIG_PACKAGE_luci-app-twofa=m"
+            echo "CONFIG_PACKAGE_luci-i18n-twofa-zh-cn=m"
+          } >> .config
           make defconfig
-          grep '^CONFIG_PACKAGE_luci-app-twofa=m' .config
+
+          # Verify the flags survived defconfig (luci.mk has to register the
+          # i18n package symbol first, otherwise defconfig drops the line).
+          grep '^CONFIG_PACKAGE_luci-app-twofa=m'         .config
+          grep '^CONFIG_PACKAGE_luci-i18n-twofa-zh-cn=m'  .config
+
           make package/luci-app-twofa/compile -j"$(nproc)" V=s
 
       - name: Collect IPK
         run: |
           mkdir -p "$GITHUB_WORKSPACE/release"
-          IPK="$(find "$GITHUB_WORKSPACE/sdk/bin/packages" -name 'luci-app-twofa*.ipk' | head -1)"
-          if [ -z "$IPK" ]; then
-            echo "ERROR: luci-app-twofa IPK not found" >&2
+
+          # Grab every twofa-related ipk (main + all luci-i18n-twofa-* language
+          # packs). Both package names share the "twofa" substring so one glob
+          # catches both.
+          #
+          # PKGARCH is `all` so the bytes don't actually differ across matrix
+          # legs - but we still tag each file with the platform suffix so the
+          # final release exposes one file per (package, arch) combination
+          # (4 files for 2 packages * 2 archs). Users pick "the ipk for my
+          # router" without having to think about LuCI's arch-neutrality.
+          set -e
+          found=0
+          for ipk in $(find "$GITHUB_WORKSPACE/sdk/bin/packages" -name '*twofa*.ipk' | sort); do
+            base="$(basename "$ipk" .ipk)"
+            case "$base" in
+              *_all) renamed="${base%_all}_${{ matrix.platform }}.ipk" ;;
+              *)     renamed="${base}_${{ matrix.platform }}.ipk" ;;
+            esac
+            cp -v "$ipk" "$GITHUB_WORKSPACE/release/${renamed}"
+            found=$((found + 1))
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "ERROR: no twofa ipk produced under sdk/bin/packages" >&2
+            find "$GITHUB_WORKSPACE/sdk/bin/packages" -name '*.ipk' >&2 || true
             exit 1
           fi
-          cp "$IPK" "$GITHUB_WORKSPACE/release/luci-app-twofa_${{ matrix.platform }}_all.ipk"
+          echo "Collected $found ipk(s):"
           ls -lh "$GITHUB_WORKSPACE/release"
 
       - name: Upload Artifact
@@ -93,11 +127,102 @@ jobs:
           name: luci-app-twofa-${{ matrix.platform }}
           path: ${{ github.workspace }}/release/*.ipk
 
-  release_upload:
-    name: Upload Release Assets
+  # =========================================================================
+  # Tagged release: PERMANENT, versioned, with curated CHANGELOG.md notes.
+  # Triggered by pushing a `v*` tag, e.g. `git tag v1.0-r15 && git push --tags`.
+  # These releases are NOT pre-releases, so GitHub auto-promotes the newest
+  # one to the "Latest release" badge on the project's Releases page.
+  # =========================================================================
+  release_tag:
+    name: Tagged Release
     if: startsWith(github.ref, 'refs/tags/')
     needs: build_packages
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source (needed to read CHANGELOG.md)
+        uses: actions/checkout@v4
+
+      - name: Download all IPK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: luci-app-twofa-*
+          merge-multiple: true
+
+      - name: List release files
+        run: find artifacts -name '*.ipk' -exec ls -lh {} \;
+
+      # Pull the CHANGELOG.md section that matches this tag and use it as
+      # the release body. Tag format is `v<version>` (e.g. v1.0-r15) and the
+      # corresponding CHANGELOG header is `## [<version>] - <date>`.
+      #
+      # Falls back to a placeholder if no matching section is found, so a
+      # forgotten CHANGELOG entry doesn't break the release. GitHub's
+      # auto-generated "What's Changed" section is still appended below.
+      - name: Extract changelog section for ${{ github.ref_name }}
+        run: |
+          set -e
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "Looking for CHANGELOG section [$VERSION]..."
+
+          awk -v ver="$VERSION" '
+            BEGIN { p=0 }
+            /^## \[/ {
+              if (p) exit
+              if (index($0, "[" ver "]") > 0) { p=1; print; next }
+            }
+            p { print }
+          ' CHANGELOG.md > release_notes.md
+
+          if [ ! -s release_notes.md ]; then
+            cat > release_notes.md <<EOF
+          ## $VERSION
+
+          _No CHANGELOG.md entry found for this version. See the auto-generated
+          commit list below._
+          EOF
+          fi
+
+          echo "---- release notes ----"
+          cat release_notes.md
+          echo "-----------------------"
+
+      - name: Publish tagged release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release_notes.md
+          # GitHub appends its own "What's Changed" + contributors section to
+          # whatever body_path provides, giving users both the curated notes
+          # and the raw commit history since the previous tag.
+          generate_release_notes: true
+          files: artifacts/**/*.ipk
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # =========================================================================
+  # Rolling pre-release: overwrites a single `latest` tag on every push to
+  # main, so users always have a known stable download URL for the freshest
+  # build. Marked as pre-release so GitHub does NOT show this in the
+  # "Latest release" slot - tagged v* releases own that slot.
+  #
+  # Skipped on tag pushes (no need to publish the same artifacts twice) and
+  # on pull-request runs (no token / no need).
+  # =========================================================================
+  release_rolling:
+    name: Rolling latest Release
+    if: |
+      github.event_name == 'push'
+      && !startsWith(github.ref, 'refs/tags/')
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    needs: build_packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Download all IPK artifacts
@@ -110,9 +235,44 @@ jobs:
       - name: List release files
         run: find artifacts -name '*.ipk' -exec ls -lh {} \;
 
-      - name: Upload to Release
+      - name: Wipe previous rolling release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # action-gh-release upserts assets but never removes stale ones, so a
+        # PKG_RELEASE bump (filename r15 -> r16) would leave both copies on
+        # the rolling release forever. Delete the release + tag first so we
+        # start from a clean slate. `|| true` keeps the very first run
+        # (no existing release) from failing.
+        #
+        # Note: this ONLY wipes the `latest` pre-release. Tagged v*
+        # releases are never touched.
+        run: |
+          gh release delete latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+
+      - name: Publish rolling release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: latest
+          name: "Rolling build (latest main)"
+          prerelease: true
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
           files: artifacts/**/*.ipk
+          body: |
+            Auto-built from the latest commit on `main`. This is a **pre-release**
+            for early adopters - prefer the [tagged releases](../../releases)
+            for daily use.
+
+            **Tested only on** ImmortalWrt 24.10 with the bundled Lua 5.1.5
+            (double int32) runtime. Other OpenWrt forks running Lua 5.1 / 5.3+
+            with rpcd, nixio and qrencode should work but are not in CI.
+
+            **Install order** (main package first, language pack optional):
+            ```sh
+            opkg install ./luci-app-twofa_*.ipk
+            opkg install ./luci-i18n-twofa-zh-cn_*.ipk   # 中文 UI，可选
+            ```
+
+            Commit: ${{ github.sha }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
