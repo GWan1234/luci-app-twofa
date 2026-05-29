@@ -1,11 +1,11 @@
 -- TOTP (RFC 6238) verifier.
 --
--- Two production lessons baked into this rewrite:
+-- Production lessons baked into this rewrite (each cost real debugging time):
 --
 --   1. base32 decoding must mask the accumulator after every emitted byte,
 --      otherwise `buffer` exceeds 2^31 by the 13th input char and Lua 5.3+
---      (which ImmortalWrt / recent OpenWrt ships) raises
---      "arithmetic overflow" on integer conversion.
+--      (which recent OpenWrt ships) raises "arithmetic overflow" on
+--      integer conversion.
 --
 --   2. nixio.crypto is OPTIONAL. The libnixio variant shipped on some
 --      firmwares (notably ImmortalWrt's default) was compiled without
@@ -13,6 +13,14 @@
 --      ship a self-contained pure-Lua HMAC-SHA1 implementation that uses
 --      only band/bor/bxor on 32-bit values plus arithmetic rotates, which
 --      works on every Lua bit module that has ever shipped with LuCI.
+--
+--   3. NO "\xNN" STRING ESCAPES ANYWHERE. The `\x` hex escape is a Lua 5.2+
+--      feature. ImmortalWrt patches Lua 5.1 in a way that *silently drops*
+--      the backslash instead of erroring, so "\x80" turns into the
+--      3-character literal "x80" - which corrupts every byte fed into SHA-1
+--      and produces wrong-but-perfectly-consistent TOTP codes. Use
+--      string.char(0xNN) or the decimal escape "\NNN" instead.
+--      \0 is a decimal escape (\\zero) and is fine.
 
 local nixio = require "nixio"
 
@@ -27,17 +35,17 @@ end
 assert(bit and bit.band and bit.bor and bit.bxor,
 	"totp: no bit module available (need nixio.bit, bit, or bit32)")
 
--- IMPORTANT: nixio.bit on Lua 5.1 (which OpenWrt / ImmortalWrt ships) returns
--- *signed* int32 results - bxor(0x12345678, 0x9ABCDEF0) comes back as
--- -2003391608 instead of 0x88898988 because lua_pushinteger boxes it through
--- a signed lua_Integer. The rest of this module does plain arithmetic on
--- those values (rol uses math.floor/division, additions assume non-negative)
--- and silently produces garbage when fed negatives - that's the exact bug
--- that made every RFC 6238 vector fail with a different wrong code.
+-- Wrap every bit op to normalise the result back into [0, 2^32) regardless of
+-- whether the underlying module returns signed or unsigned int32.
 --
--- Wrap every bit op to normalise the result back into [0, 2^32). LuaBitOp,
--- bit32, and nixio.bit on Lua 5.3+ all happen to already return unsigned
--- values, so the wrappers are no-ops there; the cost is one comparison.
+-- Empirically, nixio.bit on the ImmortalWrt-patched Lua 5.1 ("(double int32)")
+-- already returns proper unsigned values, so this wrapper is a no-op there.
+-- BUT LuaBitOp (Mike Pall's bit module, common on LuaJIT-based forks) returns
+-- *signed* int32 - bxor(0x12345678, 0x9ABCDEF0) becomes a negative number.
+-- The rest of this module does arithmetic on those results (rol uses
+-- math.floor/division, additions assume non-negative) and silently produces
+-- garbage when fed negatives. The wrapper costs one comparison per call to
+-- guarantee correctness across every bit implementation LuCI might encounter.
 local function uint32(x)
 	if x < 0 then return x + 0x100000000 end
 	return x
@@ -63,9 +71,18 @@ end
 -- ----------------------------------------------------------------------------
 -- SHA-1 over an arbitrary byte string. Returns 20 raw bytes.
 -- ----------------------------------------------------------------------------
+-- The SHA-1 padding byte 0x80. Written via string.char so it survives Lua 5.1
+-- builds that DON'T understand the \xNN hex escape (Lua 5.2 added \x; some
+-- ImmortalWrt-patched Lua 5.1 silently drops the leading backslash and turns
+-- "\x80" into the 3-character literal "x80" - which made our SHA-1 hash the
+-- wrong bytes and produced wrong-but-consistent TOTP codes for an entire
+-- week of debugging. Decimal escapes ("\128") would also work, but
+-- string.char is unambiguous and there is no per-call cost worth worrying about.
+local PAD80 = string.char(0x80)
+
 local function sha1(msg)
 	local orig_len = #msg
-	msg = msg .. "\x80"
+	msg = msg .. PAD80
 	while (#msg % 64) ~= 56 do
 		msg = msg .. "\0"
 	end
