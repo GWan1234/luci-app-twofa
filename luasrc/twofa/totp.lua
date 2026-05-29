@@ -80,7 +80,7 @@ local function sha1(msg)
 		for i = 0, 79 do
 			local f, k
 			if i < 20 then
-				f = bor(band(b, c), band(0xFFFFFFFF - b, d))
+				f = bor(band(b, c), band(bxor(0xFFFFFFFF, b), d))
 				k = 0x5A827999
 			elseif i < 40 then
 				f = bxor(bxor(b, c), d)
@@ -202,11 +202,56 @@ function M.verify(secret, token)
 	if type(secret) ~= "string" or type(token) ~= "string" or #token ~= 6 then
 		return false
 	end
-	return token == generate(secret, 0) or token == generate(secret, -1)
+	-- Accept codes from previous, current, and next time windows for clock drift tolerance
+	return token == generate(secret, -1) or
+	       token == generate(secret, 0) or
+	       token == generate(secret, 1)
 end
 
 -- Exposed for diagnostics. Lets you run, e.g.:
 --   lua -e 'print(require("luci.twofa.totp").generate("JBSWY3DPEHPK3PXP", 0))'
 M.generate = generate
+
+-- Debug function to diagnose TOTP generation issues
+function M.debug_generate(secret, offset, period)
+	local key = base32_decode(secret)
+	print("[DEBUG] Secret (Base32): " .. secret)
+	print("[DEBUG] Key length: " .. #key .. " bytes")
+	print("[DEBUG] Key (hex): " .. (key:gsub(".", function(c)
+		return string.format("%02x", string.byte(c))
+	end)))
+
+	local counter = math.floor(os.time() / (period or 30)) + (offset or 0)
+	print("[DEBUG] Counter (T): " .. counter)
+
+	local packed = pack_int64(counter)
+	print("[DEBUG] Counter (packed hex): " .. (packed:gsub(".", function(c)
+		return string.format("%02x", string.byte(c))
+	end)))
+
+	local hash = hmac_sha1(key, packed)
+	print("[DEBUG] HMAC-SHA1 length: " .. #hash)
+	print("[DEBUG] HMAC-SHA1 (hex): " .. (hash:gsub(".", function(c)
+		return string.format("%02x", string.byte(c))
+	end)))
+
+	local off = band(string.byte(hash, -1), 0x0F)
+	print("[DEBUG] Offset: " .. off)
+
+	local b1 = band(string.byte(hash, off + 1), 0x7F)
+	local b2 = string.byte(hash, off + 2)
+	local b3 = string.byte(hash, off + 3)
+	local b4 = string.byte(hash, off + 4)
+
+	print("[DEBUG] Bytes: " .. b1 .. " " .. b2 .. " " .. b3 .. " " .. b4)
+
+	local bin = b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
+	print("[DEBUG] Binary value: " .. bin)
+
+	local code = string.format("%06d", bin % 1000000)
+	print("[DEBUG] Final code: " .. code)
+
+	return code
+end
 
 return M

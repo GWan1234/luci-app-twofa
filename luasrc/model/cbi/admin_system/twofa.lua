@@ -2,11 +2,28 @@ local uci = require "luci.model.uci".cursor()
 local sys = require "luci.sys"
 local util = require "luci.util"
 
-local function generate_secret()
+local function generate_secret(length)
+	length = length or 16
 	local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
 	local secret = ""
-	math.randomseed(os.time())
-	for i = 1, 16 do
+	
+	-- Try to use cryptographically secure random source first
+	local f = io.open("/dev/urandom", "rb")
+	if f then
+		local data = f:read(length)
+		f:close()
+		if data then
+			for i = 1, #data do
+				local byte = string.byte(data, i)
+				secret = secret .. chars:sub((byte % #chars) + 1, (byte % #chars) + 1)
+			end
+			return secret
+		end
+	end
+	
+	-- Fallback: use math.random with better seeding
+	math.randomseed(os.time() + os.clock() * 1000000)
+	for i = 1, length do
 		local idx = math.random(1, #chars)
 		secret = secret .. chars:sub(idx, idx)
 	end
