@@ -1,0 +1,103 @@
+#!/usr/bin/lua
+-- /usr/sbin/luci-app-twofa-guardd
+--
+-- Persistent session guard. Closes the "non-browser bypass" gap in the
+-- rpcd plugin: status() downgrades a session lazily on call, so the browser
+-- preload that polls status() every 30 seconds catches LuCI sessions, but
+-- a non-browser client (curl, Python, ssh-then-ubus) that logs in over
+-- JSON-RPC never invokes status(), so without this daemon it keeps full
+-- ACL forever after authenticating.
+--
+-- Implementation: poll `ubus call session list` every POLL_INTERVAL seconds
+-- and call luci-app-twofa.status on every SID. The rpcd plugin's status
+-- method is idempotent and a no-op for sessions already in a terminal
+-- state (verified or already-downgraded), so the cost per tick is small
+-- even with many sessions.
+--
+-- Worst-case bypass window for non-browser clients: POLL_INTERVAL seconds.
+-- With the default 1s setting, an attacker has at most ~1s to issue
+-- destructive ubus calls after login before their ACLs are revoked.
+--
+-- NB: ssh / dropbear access is NOT in scope. This daemon only protects
+-- LuCI / rpcd RPC sessions. Anyone with the root ssh password can already
+-- do anything; harden dropbear with key-only auth if that matters.
+
+local json = require "luci.jsonc"
+
+local POLL_INTERVAL = 1     -- seconds between scans
+
+local nixio_ok, nixio = pcall(require, "nixio")
+if not nixio_ok then nixio = nil end
+
+local function shellquote(s)
+	return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
+end
+
+local function log_err(msg)
+	os.execute("logger -t luci-app-twofa-guard " ..
+		shellquote("ERR: " .. tostring(msg)))
+end
+
+local function sleep(sec)
+	if nixio and nixio.nanosleep then
+		nixio.nanosleep(sec, 0)
+	else
+		os.execute("sleep " .. tostring(sec))
+	end
+end
+
+local function list_sessions()
+	local p = io.popen("ubus call session list 2>/dev/null")
+	if not p then return {} end
+	local raw = p:read("*a") or ""
+	p:close()
+	if raw == "" then return {} end
+
+	local parsed = json.parse(raw)
+	if type(parsed) ~= "table" then return {} end
+
+	-- rpcd session.list without args returns either of two shapes,
+	-- depending on rpcd version:
+	--   A) { "<sid>": { acls=..., expires=..., timeout=..., data=... }, ... }
+	--   B) { sessions = [{ ubus_rpc_session="<sid>", ... }, ... ] }
+	-- Handle both so the daemon works across OpenWrt 22.x .. 24.x.
+	local sids = {}
+	if type(parsed.sessions) == "table" then
+		for _, s in ipairs(parsed.sessions) do
+			if type(s) == "table" and type(s.ubus_rpc_session) == "string"
+			   and #s.ubus_rpc_session >= 16 then
+				sids[#sids + 1] = s.ubus_rpc_session
+			end
+		end
+	else
+		for k, v in pairs(parsed) do
+			if type(k) == "string" and #k >= 16 and type(v) == "table" then
+				sids[#sids + 1] = k
+			end
+		end
+	end
+	return sids
+end
+
+local function poke(sid)
+	-- Inline-quote the SID into the JSON. SIDs from rpcd are hex (a-f0-9)
+	-- but we also pass through shellquote on the whole payload so any
+	-- pathological value cannot break out of the shell argument.
+	local payload = string.format('{"ubus_rpc_session":"%s"}', sid)
+	os.execute("ubus call luci-app-twofa status " ..
+		shellquote(payload) .. " >/dev/null 2>&1")
+end
+
+local function tick()
+	for _, sid in ipairs(list_sessions()) do
+		poke(sid)
+	end
+end
+
+-- Main loop. pcall every tick so a one-off ubus hiccup doesn't take the
+-- daemon down; procd will respawn if we actually exit.
+while true do
+	local ok, err = pcall(tick)
+	if not ok then log_err(err) end
+	sleep(POLL_INTERVAL)
+end

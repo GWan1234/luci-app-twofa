@@ -1,8 +1,10 @@
 #!/bin/sh
-# Initialize twofa config and grant rpcd ACL for root.
-# Never run uci against /etc/config/twofa until the file parses cleanly.
+# Initialize twofa config, migrate legacy in-UCI secret to /etc/twofa.secret,
+# grant the rpcd ACL to every root login section, and kick the session-guard
+# daemon. Idempotent: safe to re-run.
 
 name="luci-app-twofa"
+SECRET_FILE=/etc/twofa.secret
 changed_twofa=0
 changed_rpcd=0
 
@@ -14,47 +16,18 @@ config twofa 'global'
 EOF
 }
 
-generate_secret() {
-	# 16-char base32 secret for TOTP.
-	#
-	# IMPORTANT: openssl rand has -hex and -base64 but NOT -base32, so the
-	# previous `openssl rand -base32 20` call returned an empty string and
-	# silently committed `secret=""` into UCI - that's how router and
-	# authenticator could end up holding *different* secrets even when the
-	# user never explicitly regenerated.
-	#
-	# Pull random bytes from /dev/urandom and let tr filter them to the
-	# base32 alphabet directly. tr is in busybox on every OpenWrt build.
-	local s
-	s="$(tr -dc 'A-Z2-7' </dev/urandom 2>/dev/null | head -c 16)"
-	if [ -n "$s" ] && [ "${#s}" -eq 16 ]; then
-		printf '%s' "$s"
-		return
-	fi
-
-	# Last-resort fallback. awk's srand() with no args seeds from the system
-	# clock in busybox awk; without it we'd produce the SAME secret on every
-	# boot, which is obviously catastrophic.
-	awk 'BEGIN {
-		srand()
-		split("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", c, "")
-		for (i = 1; i <= 16; i++)
-			printf "%s", c[int(rand() * 32) + 1]
-	}'
-}
-
 twofa_config_ok() {
 	[ -f /etc/config/twofa ] || return 1
 	uci -q show twofa >/dev/null 2>&1
 }
 
-# --- twofa: recreate broken/empty/whitespace-only config before any uci access ---
+# --- twofa: recreate broken / missing / unparseable config ---
 if ! twofa_config_ok; then
 	write_twofa_config
 	changed_twofa=1
 fi
 
-# Migrate legacy section type: config settings 'global'
+# Migrate legacy section type: `config settings 'global'`
 typ="$(uci -q get twofa.global 2>/dev/null)" || typ=""
 if [ "$typ" = "settings" ]; then
 	uci -q set twofa.global=twofa
@@ -68,33 +41,58 @@ if ! uci -q get twofa.global >/dev/null 2>&1; then
 	changed_twofa=1
 fi
 
-secret="$(uci -q get twofa.global.secret 2>/dev/null)" || secret=""
-if [ -n "$secret" ] && [ -z "$(echo "$secret" | tr -d ' \t')" ]; then
+# --- v1.0-r16: secret moves out of UCI into /etc/twofa.secret (0600) ---
+#
+# UCI configs are world-readable (0644) by default and are commonly included
+# in sysupgrade backups. Storing the TOTP secret there means anyone who
+# obtains a backup can derive every future code. The secret now lives in
+# /etc/twofa.secret with mode 0600 (root-only).
+#
+# Migration: copy the old uci-stored secret to the file (if absent), then
+# unset it from UCI regardless so it never lingers.
+legacy_secret="$(uci -q get twofa.global.secret 2>/dev/null)" || legacy_secret=""
+if [ -n "$legacy_secret" ]; then
+	if [ ! -s "$SECRET_FILE" ]; then
+		legacy_secret_clean="$(printf '%s' "$legacy_secret" | tr -d ' \t\r\n')"
+		if [ "${#legacy_secret_clean}" -ge 16 ]; then
+			umask 077
+			printf '%s\n' "$legacy_secret_clean" > "$SECRET_FILE"
+			chmod 0600 "$SECRET_FILE"
+			logger -t "$name" "migrated TOTP secret from uci to ${SECRET_FILE}"
+		fi
+	fi
 	uci -q delete twofa.global.secret 2>/dev/null
-	secret=""
 	changed_twofa=1
 fi
 
-if [ -z "$secret" ]; then
-	new_secret="$(generate_secret)"
-	# Guard against generate_secret() somehow returning empty/short output -
-	# committing secret="" would brick TOTP forever because the verify path
-	# treats < 16 chars as "no secret configured".
-	if [ -n "$new_secret" ] && [ "${#new_secret}" -ge 16 ]; then
-		uci -q set twofa.global.secret="$new_secret"
-		changed_twofa=1
+# Generate a fresh secret if the file is missing or too short.
+need_gen=0
+if [ ! -s "$SECRET_FILE" ]; then
+	need_gen=1
+elif [ "$(wc -c <"$SECRET_FILE" 2>/dev/null || echo 0)" -lt 16 ]; then
+	need_gen=1
+fi
+if [ "$need_gen" = "1" ]; then
+	if /usr/sbin/twofa-genkey >/dev/null 2>&1; then
+		logger -t "$name" "generated new TOTP secret in ${SECRET_FILE}"
 	else
-		logger -t "$name" "WARN: generate_secret() returned empty; leaving twofa.global.secret unset"
+		logger -t "$name" "WARN: twofa-genkey failed; 2FA will refuse to enable until a secret exists"
 	fi
 fi
 
+# Defensive chmod even if file already existed (older installs may have
+# created it with default umask).
+[ -f "$SECRET_FILE" ] && chmod 0600 "$SECRET_FILE"
+
 [ "$changed_twofa" = "1" ] && uci -q commit twofa
 
-# --- rpcd ACL for root (supports @login[0] and named login sections) ---
+# --- rpcd ACL for root login sections ---
 [ -f /etc/config/rpcd ] || exit 0
 
 if uci -q show rpcd 2>/dev/null | grep -qF ".acl=${name}"; then
-	exit 0
+	# ACL already granted on at least one login section. Even so, walk all
+	# root logins below so a freshly-added one still gets it.
+	:
 fi
 
 for line in $(uci -q show rpcd 2>/dev/null | grep '=login$'); do
@@ -108,5 +106,13 @@ for line in $(uci -q show rpcd 2>/dev/null | grep '=login$'); do
 done
 
 [ "$changed_rpcd" = "1" ] && uci -q commit rpcd
+
+# Restart the guard daemon now that config + secret are in place. The
+# package postinst also handles this, but uci-defaults can run on its own
+# (factory reset, manual re-run) so we cover that case too.
+if [ -x /etc/init.d/luci-app-twofa-guard ]; then
+	/etc/init.d/luci-app-twofa-guard enable  >/dev/null 2>&1 || true
+	/etc/init.d/luci-app-twofa-guard restart >/dev/null 2>&1 || true
+fi
 
 exit 0

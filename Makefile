@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-twofa
 PKG_VERSION:=1.0
-PKG_RELEASE:=15
+PKG_RELEASE:=16
 
 # luci.mk auto-generates luci-i18n-<name>-<lang> packages whose VERSION is
 # pulled from PKG_PO_VERSION (default: $(call findrev) on po/ via git log).
@@ -43,6 +43,13 @@ define Package/$(PKG_NAME)/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
 
+# Ensure binaries we ship are executable. opkg should preserve modes but
+# IPK roundtrips on some hosts have been known to strip the +x bit.
+chmod +x /usr/libexec/rpcd/luci-app-twofa     2>/dev/null || true
+chmod +x /usr/sbin/twofa-genkey               2>/dev/null || true
+chmod +x /usr/sbin/luci-app-twofa-guardd      2>/dev/null || true
+chmod +x /etc/init.d/luci-app-twofa-guard     2>/dev/null || true
+
 # rpcd: restart so /usr/libexec/rpcd/luci-app-twofa is enumerated and the
 # luci-app-twofa ubus object becomes resolvable (rpcd derives the object name
 # from the script's basename verbatim).
@@ -53,15 +60,33 @@ define Package/$(PKG_NAME)/postinst
 # don't get re-applied to brand-new sessions.
 rm -f /var/run/luci-twofa-sessions.json
 
+# session-guard daemon: this is what actually closes the non-browser bypass
+# (see /usr/sbin/luci-app-twofa-guardd for the threat model). Enabling and
+# starting here means a fresh install is protected immediately; the
+# uci-defaults script does the same on factory reset.
+/etc/init.d/luci-app-twofa-guard enable  >/dev/null 2>&1 || true
+/etc/init.d/luci-app-twofa-guard restart >/dev/null 2>&1 || true
+
 # Clear LuCI menu/module cache so new menu.d/acl.d entries take effect.
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null
 
 exit 0
 endef
 
+define Package/$(PKG_NAME)/prerm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+/etc/init.d/luci-app-twofa-guard stop    >/dev/null 2>&1 || true
+/etc/init.d/luci-app-twofa-guard disable >/dev/null 2>&1 || true
+exit 0
+endef
+
 define Package/$(PKG_NAME)/postrm
 #!/bin/sh
 rm -f /var/run/luci-twofa-sessions.json 2>/dev/null
+# NOTE: we intentionally do NOT delete /etc/twofa.secret on uninstall.
+# The user may want to reinstall without losing their authenticator binding;
+# they can `rm /etc/twofa.secret` manually if they want a hard wipe.
 /etc/init.d/rpcd restart >/dev/null 2>&1 || true
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null
 exit 0

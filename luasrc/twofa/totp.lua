@@ -232,60 +232,80 @@ local function generate(secret, offset, period)
 	return string.format("%06d", bin % 1000000)
 end
 
-function M.verify(secret, token)
-	if type(secret) ~= "string" or type(token) ~= "string" or #token ~= 6 then
+-- ----------------------------------------------------------------------------
+-- Constant-time string compare. Used for TOTP token comparison so the wall
+-- clock cost is independent of how many leading characters happen to match.
+-- (For 6-digit tokens over network latency the timing channel is far below
+-- noise floor in practice, but verify() is the *one* function in this whole
+-- module that lives in the security boundary, so we hold the line.)
+-- ----------------------------------------------------------------------------
+local function ct_equal(a, b)
+	if type(a) ~= "string" or type(b) ~= "string" or #a ~= #b then
 		return false
 	end
-	-- Accept codes from previous, current, and next time windows for clock drift tolerance
-	return token == generate(secret, -1) or
-	       token == generate(secret, 0) or
-	       token == generate(secret, 1)
+	local diff = 0
+	for i = 1, #a do
+		diff = bor(diff, bxor(string.byte(a, i), string.byte(b, i)))
+	end
+	return diff == 0
+end
+
+-- ----------------------------------------------------------------------------
+-- verify_window:  returns (matched_bool, matched_counter_or_nil).
+--
+-- Computes ALL candidate codes in [-window, +window] before deciding the
+-- result; previously verify() used `a == g(-1) or a == g(0) or a == g(1)`,
+-- which is short-circuiting OR, leaking through total CPU time which slot
+-- the user happened to match. The leak isn't directly exploitable but it
+-- combines with brute-force to halve the search space, so we kill it.
+--
+-- matched_counter is the absolute time-slot (floor(unix/30) + offset) the
+-- token matched in. The caller persists it so a replayed token from the
+-- same or earlier slot can be rejected (RFC 6238 §5.2 "The verifier MUST
+-- disallow re-use of the previously consumed step").
+-- ----------------------------------------------------------------------------
+function M.verify_window(secret, token, window)
+	if type(secret) ~= "string" or type(token) ~= "string" or #token ~= 6 then
+		return false, nil
+	end
+	window = window or 1
+	local now_slot = math.floor(os.time() / 30)
+
+	local matched         = false
+	local matched_counter = nil
+	-- Iterate in fixed order; ct_equal is constant time per pair; generate
+	-- is always called once per offset regardless of earlier match state.
+	for off = -window, window do
+		local cand = generate(secret, off)
+		if ct_equal(cand, token) and not matched then
+			matched         = true
+			matched_counter = now_slot + off
+		end
+	end
+	return matched, matched_counter
+end
+
+-- Boolean-only wrapper preserved for backwards compatibility.
+function M.verify(secret, token)
+	local ok, _ = M.verify_window(secret, token, 1)
+	return ok
 end
 
 -- Exposed for diagnostics. Lets you run, e.g.:
 --   lua -e 'print(require("luci.twofa.totp").generate("JBSWY3DPEHPK3PXP", 0))'
-M.generate = generate
+M.generate  = generate
 
--- Debug function to diagnose TOTP generation issues
-function M.debug_generate(secret, offset, period)
-	local key = base32_decode(secret)
-	print("[DEBUG] Secret (Base32): " .. secret)
-	print("[DEBUG] Key length: " .. #key .. " bytes")
-	print("[DEBUG] Key (hex): " .. (key:gsub(".", function(c)
-		return string.format("%02x", string.byte(c))
-	end)))
+-- Exposed for the rpcd plugin to hash session ids when nixio.crypto.hash
+-- is unavailable (libnixio compiled without OpenSSL). NOT part of the
+-- public API; do not depend on this from third-party code.
+M._sha1     = sha1
+M._ct_equal = ct_equal
 
-	local counter = math.floor(os.time() / (period or 30)) + (offset or 0)
-	print("[DEBUG] Counter (T): " .. counter)
-
-	local packed = pack_int64(counter)
-	print("[DEBUG] Counter (packed hex): " .. (packed:gsub(".", function(c)
-		return string.format("%02x", string.byte(c))
-	end)))
-
-	local hash = hmac_sha1(key, packed)
-	print("[DEBUG] HMAC-SHA1 length: " .. #hash)
-	print("[DEBUG] HMAC-SHA1 (hex): " .. (hash:gsub(".", function(c)
-		return string.format("%02x", string.byte(c))
-	end)))
-
-	local off = band(string.byte(hash, -1), 0x0F)
-	print("[DEBUG] Offset: " .. off)
-
-	local b1 = band(string.byte(hash, off + 1), 0x7F)
-	local b2 = string.byte(hash, off + 2)
-	local b3 = string.byte(hash, off + 3)
-	local b4 = string.byte(hash, off + 4)
-
-	print("[DEBUG] Bytes: " .. b1 .. " " .. b2 .. " " .. b3 .. " " .. b4)
-
-	local bin = b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
-	print("[DEBUG] Binary value: " .. bin)
-
-	local code = string.format("%06d", bin % 1000000)
-	print("[DEBUG] Final code: " .. code)
-
-	return code
-end
+-- NOTE: a previous revision shipped M.debug_generate that printed the raw
+-- secret, key bytes, and HMAC output to stdout. It has been removed - any
+-- caller that piped stdout into an HTTP response would leak the shared
+-- secret. The selftest script under /tmp/totp_selftest.lua (developer
+-- artefact, not packaged) still re-derives those values locally without
+-- printing them as part of the public module surface.
 
 return M

@@ -15,6 +15,113 @@ section verbatim and pastes it as the release body.
 
 ## [Unreleased]
 
+## [1.0-r16] - 2026-05-29
+
+### Security
+
+This release closes a full sweep of weaknesses surfaced by an internal
+audit. Anyone running r15 or earlier should upgrade as soon as possible.
+
+- **Authentication bypass (critical, CVSS-equivalent ~9.1).** The rpcd
+  plugin's ACL downgrade was triggered lazily by the browser preload's
+  `status()` poll. Non-browser clients (curl, Python, raw `ubus` over
+  unix socket from ssh) never invoked `status()` and kept full ACLs
+  indefinitely after authenticating with the password. A new persistent
+  daemon (`/usr/sbin/luci-app-twofa-guardd`, procd-managed via
+  `/etc/init.d/luci-app-twofa-guard`) now polls `ubus call session list`
+  every second and forces a downgrade on every session, closing this gap
+  to a worst-case ~1 s window regardless of client type. Note: ssh /
+  dropbear login is explicitly out of scope; anyone with the root ssh
+  credentials can already do anything.
+- **Brute force (critical).** `verify()` accepted unlimited attempts. A
+  per-session attempt counter is now enforced: 5 failures triggers a
+  60 s lockout, doubling each engagement up to 30 min. Counters survive
+  downgrade so an attacker cannot reset by re-calling `status()`.
+- **Replay (high).** The previous 90 s acceptance window (slots
+  -1/0/+1) was reusable: a captured valid token could be replayed up
+  to two extra times. `verify_window()` now returns the matched counter
+  and the rpcd plugin persists the last accepted counter per session;
+  any new attempt with counter ≤ last is rejected as `totp_replayed`,
+  implementing RFC 6238 §5.2.
+- **Weak fallback RNG (high).** The CBI's `generate_secret()` had a
+  `math.random` fallback seeded by `os.time() + os.clock() * 1e6`,
+  giving a brute-forceable secret if `/dev/urandom` was unavailable.
+  Removed. Secret generation now lives exclusively in
+  `/usr/sbin/twofa-genkey`, which refuses to fall back to anything
+  other than `/dev/urandom`.
+- **Timing oracle (medium).** Token comparison used Lua string `==`
+  (byte-by-byte, short-circuit) plus short-circuit `or` across the
+  three windows, leaking through wall-clock timing which slot matched.
+  `verify_window()` now computes every candidate in fixed order and
+  uses a constant-time byte compare.
+- **Secret at rest (medium).** The TOTP secret used to live in
+  `/etc/config/twofa` (default mode 0644, included in sysupgrade
+  backups). It is now stored in `/etc/twofa.secret` with mode 0600,
+  written atomically via `mktemp`+`chmod`+`mv` so there is no
+  world-readable window. The uci-defaults script migrates pre-r16
+  installs automatically.
+- **Session state token leakage (medium).** Session records in
+  `/var/run/luci-twofa-sessions.json` used the raw rpc session id as
+  the key, meaning a file leak yielded live bearer tokens. Records are
+  now keyed by SHA-256 of the SID; the daemon can still find the right
+  record but a stolen file is useless.
+- **State file write race (medium).** `fs.writefile()` created with
+  the default umask (typically 0644) before `chmod 0600` ran. The new
+  `write_state()` does `mktemp` + `chmod 0600` + write + atomic
+  `os.rename`, eliminating the window.
+- **Incomplete ACL downgrade (medium).** The previous `KEEP_SCOPES`
+  / `PRESERVE_UBUS_OBJ` model touched only `ubus`/`uci`/`file` and
+  preserved every method on the `session` ubus object (including
+  `grant`/`destroy`/`create`). Replaced with an explicit
+  `(scope, object, method)` allow list that pins `session` to
+  `access()` only and revokes everything else regardless of scope.
+- **Debug helper leaked secret material (low).** `totp.debug_generate`
+  printed the raw key, HMAC, and final code to stdout. Removed from
+  the module surface; any caller wiring stdout into an HTTP response
+  would have leaked the shared secret.
+- **Shell argument injection footguns (low).** The rpcd plugin's
+  `ubus_call` / `uci_get` did not shell-quote object/method/key
+  arguments. Current callers passed only constants so there was no
+  active vulnerability, but the surface is now strict-quote everywhere.
+- **SID prefix in logs (low).** syslog entries used to include the
+  first 8 chars of the raw SID. They now include the first 8 chars of
+  the SID hash instead, so log/scrape correlation can't be used to
+  reconstruct live tokens.
+
+### Changed
+- CBI no longer auto-generates a secret at render time. A missing
+  secret is surfaced as a `(not configured - press Regenerate)`
+  notice; the admin must explicitly tick the Regenerate flag to
+  create one. This eliminates a race between concurrent renders that
+  could silently invalidate the user's existing authenticator binding.
+- `Regenerate Secret` now wipes `/var/run/luci-twofa-sessions.json`
+  so every active session must re-verify against the new secret.
+- New rpcd method `regenerate` exposed for CLI use. NOT in the
+  downgrade allow list, so only a 2FA-verified session can call it.
+
+### Added
+- `/usr/sbin/twofa-genkey` - shell utility that produces a 16-char
+  base32 secret from `/dev/urandom` and writes it atomically to
+  `/etc/twofa.secret` (mode 0600). Used by both the uci-defaults
+  bootstrapper and the CBI's Regenerate handler so there is one
+  canonical generator with one set of mode/race guarantees.
+- `/usr/sbin/luci-app-twofa-guardd` + `/etc/init.d/luci-app-twofa-guard`
+  - persistent session-guard daemon (procd-managed).
+- Internal: `totp.verify_window(secret, token, window)` returns
+  `(matched_bool, matched_counter)` so the rpcd plugin can implement
+  replay protection without re-deriving counters.
+- Internal: `totp._sha1` / `totp._ct_equal` exported for the rpcd
+  plugin's SID-hashing fallback (when `nixio.crypto.hash` is missing
+  on builds with libnixio compiled without OpenSSL).
+
+### Migration notes
+- On upgrade from r15 or earlier, the uci-defaults script moves the
+  existing `twofa.global.secret` UCI option into `/etc/twofa.secret`
+  (mode 0600) and unsets it from UCI. Your authenticator binding is
+  preserved across the upgrade.
+- All existing rpcd sessions are forcibly invalidated by the package
+  postinst so any pre-r16 ACL snapshots are discarded.
+
 ## [1.0-r15] - 2026-05-29
 
 ### Changed

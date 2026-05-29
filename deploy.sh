@@ -26,6 +26,8 @@ mkdir -p /usr/lib/lua/luci/controller/admin/system/ \
          /usr/share/luci/menu.d/ \
          /usr/share/rpcd/acl.d/ \
          /usr/libexec/rpcd/ \
+         /usr/sbin/ \
+         /etc/init.d/ \
          /etc/config/ \
          /etc/uci-defaults/; \
 rm -f /usr/lib/lua/luci/twofa/auth.lua /usr/lib/lua/luci/twofa/guard.lua; \
@@ -47,6 +49,17 @@ $SCP_CMD luasrc/twofa/totp.lua "$ROUTER_USER@$ROUTER_HOST:/usr/lib/lua/luci/twof
 echo "Syncing rpcd plugin..."
 $SCP_CMD root/usr/libexec/rpcd/luci-app-twofa "$ROUTER_USER@$ROUTER_HOST:/usr/libexec/rpcd/luci-app-twofa"
 $SSH_CMD "chmod +x /usr/libexec/rpcd/luci-app-twofa"
+
+# 5b. twofa-genkey: secret 生成器，CBI 的 Regenerate / uci-defaults 都靠它写 /etc/twofa.secret (0600)
+echo "Syncing twofa-genkey..."
+$SCP_CMD root/usr/sbin/twofa-genkey "$ROUTER_USER@$ROUTER_HOST:/usr/sbin/twofa-genkey"
+$SSH_CMD "chmod +x /usr/sbin/twofa-genkey"
+
+# 5c. session-guard 守护进程：闭合 rpcd 插件懒触发降权的非浏览器绕过窗口
+echo "Syncing session-guard daemon..."
+$SCP_CMD root/usr/sbin/luci-app-twofa-guardd "$ROUTER_USER@$ROUTER_HOST:/usr/sbin/luci-app-twofa-guardd"
+$SCP_CMD root/etc/init.d/luci-app-twofa-guard "$ROUTER_USER@$ROUTER_HOST:/etc/init.d/luci-app-twofa-guard"
+$SSH_CMD "chmod +x /usr/sbin/luci-app-twofa-guardd /etc/init.d/luci-app-twofa-guard"
 
 # 6. preload JS (rpc.declare → luci-app-twofa.{status,verify})
 echo "Syncing JS..."
@@ -103,6 +116,10 @@ $SSH_CMD "chmod +x /etc/uci-defaults/10-luci-app-twofa && /etc/uci-defaults/10-l
 # 10. 重启 rpcd，让新的 acl.d / libexec/rpcd 生效；销毁所有旧会话避免脏 ACL
 echo "Restarting RPCD..."
 $SSH_CMD "/etc/init.d/rpcd restart; sleep 1; ubus call session destroy '{\"timeout\":0}' >/dev/null 2>&1 || true"
+
+# 10b. 启动 / 重启 session-guard 守护进程
+echo "Starting session-guard..."
+$SSH_CMD "/etc/init.d/luci-app-twofa-guard enable >/dev/null 2>&1 || true; /etc/init.d/luci-app-twofa-guard restart >/dev/null 2>&1 || true"
 
 # 11. 清 LuCI 索引缓存
 $SSH_CMD "rm -rf /tmp/luci-indexcache /tmp/luci-modulecache"

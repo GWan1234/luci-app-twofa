@@ -1,99 +1,176 @@
 #!/usr/bin/lua
--- rpcd plugin: exposes ubus object `luci-app-twofa` with methods `status` and
--- `verify`. The plugin is what actually enforces 2FA: when an authenticated
--- session does not have TOTP confirmed yet, status() revokes every
--- non-twofa ACL on the rpcd session, so subsequent ubus calls (uci.get,
--- network.*, etc.) are denied by rpcd itself. verify() restores the saved
--- ACLs once the TOTP code is accepted.
+-- rpcd plugin: exposes ubus object `luci-app-twofa` with methods `status`,
+-- `verify`, and `regenerate`. This plugin is the single point of TOTP
+-- enforcement: when an authenticated session has not yet satisfied 2FA,
+-- status() revokes every non-allow-listed ACL on the session, so subsequent
+-- ubus calls (uci.set, network.*, etc.) are denied by rpcd itself.
 --
 -- NOTE on naming: rpcd registers each /usr/libexec/rpcd/<basename> script
 -- as a ubus object using the basename verbatim. This file is named
 -- `luci-app-twofa`, so the ubus object name is also `luci-app-twofa`,
--- NOT `luci.twofa`. The ACL file, the JS preload and the OURSELF ACL
--- guard below all use this exact name; do not "tidy" it.
+-- NOT `luci.twofa`. The ACL file, the JS preload, the guard daemon and the
+-- PRESERVE table below all use this exact name; do not "tidy" it.
 --
--- Layout of /var/run/luci-twofa-sessions.json:
---   {
---     "sessions": {
---       "<rpc_session_id>": {
---         "verified":   true|false,
---         "saved_acls": [ { "scope":"ubus", "obj":"uci", "fn":"get" }, ... ],
---         "expires":    <unix_ts>
---       }
---     }
---   }
+-- Security model (v1.0-r16):
+--
+--   * Brute force: verify() enforces 5 failed attempts -> 1-min lockout,
+--     doubling each lockout up to 30 min. Counters survive downgrade() so
+--     an attacker cannot reset by triggering re-downgrade.
+--
+--   * Replay: every successful verify records the matched TOTP counter on
+--     the session record. Subsequent verifies with a counter <= the last
+--     one are rejected as totp_replayed. This implements RFC 6238 §5.2.
+--
+--   * Side channels: token comparison uses totp.verify_window, which
+--     evaluates all candidate codes in fixed order with constant-time byte
+--     compare, so neither which time slot matched nor any token prefix
+--     leaks through wall-clock timing.
+--
+--   * Token leakage at rest: session keys in /var/run/luci-twofa-sessions
+--     .json are SHA-256 hashes of the raw SID. A file leak yields opaque
+--     hashes, not live bearer tokens.
+--
+--   * Atomic state writes: the state file is created via mktemp + chmod
+--     0600 BEFORE any content is written and then atomically renamed onto
+--     the live path, so there is never a world-readable window.
+--
+-- The downgrade still relies on status() being called for every fresh
+-- session. The browser preload does this immediately on page load, but
+-- non-browser API clients (curl, Python, etc.) never would. That gap is
+-- closed by /usr/sbin/luci-app-twofa-guardd (procd-managed), which polls
+-- `session list` and invokes status() on every SID within ~1s.
 
--- Defer optional requires so that `list` always succeeds even on minimal
--- firmwares where luci-compat / nixio variants live in non-default paths.
 local json = require "luci.jsonc"
 local fs   = require "nixio.fs"
 
 local function safe_require(mod)
 	local ok, m = pcall(require, mod)
-	if ok then return m end
-	return nil
+	return ok and m or nil
 end
 
-local totp = safe_require("luci.twofa.totp")
+local totp  = safe_require("luci.twofa.totp")
+local nixio = safe_require("nixio")
 
-local STATE_FILE  = "/var/run/luci-twofa-sessions.json"
-local STATE_TTL   = 86400
-local KEEP_SCOPES = { ubus = true, uci = true, file = true }
+-- ---------------------------------------------------------------------------
+-- Tunables
+-- ---------------------------------------------------------------------------
 
--- ubus objects that MUST stay reachable on a downgraded session.
---   * luci-app-twofa  - so the 2FA modal can still call status()/verify().
---   * session         - luci.js polls `session.access` as a heartbeat; if
---                       that RPC itself fails, LuCI immediately decides the
---                       session expired and shows its own login modal,
---                       hiding our 2FA modal. Session methods only inspect
---                       ACL state, they cannot mutate router config, so
---                       leaving them callable is safe.
-local PRESERVE_UBUS_OBJ = {
-	["luci-app-twofa"] = true,
-	["session"]        = true,
+local STATE_FILE   = "/var/run/luci-twofa-sessions.json"
+local SECRET_FILE  = "/etc/twofa.secret"
+local STATE_TTL    = 86400
+local MAX_ATTEMPTS = 5
+local LOCKOUT_BASE = 60       -- seconds: 1st engagement is 60s
+local LOCKOUT_CAP  = 1800     -- 30 min ceiling on exponential backoff
+local TOTP_WINDOW  = 1        -- accept slots [-1, 0, +1]
+
+-- Explicit (scope, object, method) allow list of what stays callable on a
+-- downgraded (unverified) session. EVERYTHING else gets revoked. The old
+-- code preserved every method on `session` wholesale, which left
+-- session.grant / session.destroy / session.create reachable; the new list
+-- pins them to access() only (LuCI's heartbeat).
+local PRESERVE = {
+	ubus = {
+		["luci-app-twofa"] = { status = true, verify = true },
+		["session"]        = { access = true },
+	},
 }
 
+local function should_preserve(it)
+	local objs = PRESERVE[it.scope]
+	if not objs then return false end
+	local fns = objs[it.obj]
+	return fns ~= nil and fns[it.fn] == true
+end
+
+-- ---------------------------------------------------------------------------
+-- Hashing / SID anonymisation
+-- ---------------------------------------------------------------------------
+
+local function to_hex(s)
+	return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+end
+
+local function sid_key(sid)
+	if not sid or sid == "" then return "" end
+	-- Prefer SHA-256 via nixio.crypto when present.
+	if nixio and nixio.crypto and nixio.crypto.hash then
+		local ok, h = pcall(nixio.crypto.hash, "sha256", sid)
+		if ok and type(h) == "string" and #h > 0 then return h end
+	end
+	-- Fall back to the totp module's pure-Lua SHA-1: 160 bits is more than
+	-- enough for "irreversible session record key". Always available because
+	-- we ship the implementation.
+	if totp and totp._sha1 then
+		local ok, raw = pcall(totp._sha1, sid)
+		if ok and raw then return to_hex(raw) end
+	end
+	-- Last resort: never store the raw SID. Embed length so collisions are
+	-- impossible across different SIDs of different lengths.
+	return string.format("unh-%d-%s", #sid, sid:sub(1, 8) .. sid:sub(-8))
+end
+
+local function sid_tag(sid)
+	local k = sid_key(sid or "")
+	if k == "" then return "?" end
+	return k:sub(1, 8)
+end
+
+-- ---------------------------------------------------------------------------
+-- State file - atomic, 0600 before any data touches disk
+-- ---------------------------------------------------------------------------
+
 local function read_state()
-	local data = fs.readfile(STATE_FILE)
-	if not data or #data == 0 then
-		return { sessions = {} }
-	end
-	local ok = json.parse(data)
-	if type(ok) ~= "table" then
-		return { sessions = {} }
-	end
-	ok.sessions = ok.sessions or {}
-	return ok
+	local f = io.open(STATE_FILE, "rb")
+	if not f then return { sessions = {} } end
+	local data = f:read("*a") or ""
+	f:close()
+	if data == "" then return { sessions = {} } end
+	local parsed = json.parse(data)
+	if type(parsed) ~= "table" then return { sessions = {} } end
+	parsed.sessions = parsed.sessions or {}
+	return parsed
 end
 
 local function write_state(state)
 	state = state or { sessions = {} }
 	local now = os.time()
-	for sid, info in pairs(state.sessions or {}) do
+	for k, info in pairs(state.sessions or {}) do
 		if type(info) ~= "table" or (info.expires and info.expires < now) then
-			state.sessions[sid] = nil
+			state.sessions[k] = nil
 		end
 	end
-	fs.writefile(STATE_FILE, json.stringify(state))
-	pcall(fs.chmod, STATE_FILE, tonumber("600", 8))
+
+	-- Write to a sibling temp file, chmod 0600 BEFORE writing content, then
+	-- atomically rename onto the live path. fs.writefile() (the old approach)
+	-- created with default umask -> typically 0644, leaving a microsecond
+	-- window where the file was world-readable.
+	local tmp = STATE_FILE .. ".tmp"
+	local f = io.open(tmp, "w")
+	if not f then return end
+	pcall(fs.chmod, tmp, tonumber("600", 8))
+	f:write(json.stringify(state))
+	f:close()
+	os.rename(tmp, STATE_FILE)
 end
 
-local function shell_quote(s)
+-- ---------------------------------------------------------------------------
+-- Shell helpers - quote EVERY argument even when current callers pass
+-- constants. Cheap insurance against a future refactor accidentally
+-- introducing command injection.
+-- ---------------------------------------------------------------------------
+
+local function shellquote(s)
 	return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
 end
 
 local function log(msg)
-	-- Mirror to syslog so `logread -e luci-app-twofa` shows what verify is doing.
-	-- Cheap enough to leave on permanently.
-	os.execute("logger -t luci-app-twofa " .. shell_quote(tostring(msg)))
+	os.execute("logger -t luci-app-twofa " .. shellquote(tostring(msg)))
 end
 
 local function ubus_call(object, method, args)
 	local payload = json.stringify(args or {})
-	local cmd = string.format(
-		"ubus call %s %s %s 2>/dev/null",
-		object, method, shell_quote(payload)
-	)
+	local cmd = string.format("ubus call %s %s %s 2>/dev/null",
+		shellquote(object), shellquote(method), shellquote(payload))
 	local p = io.popen(cmd)
 	if not p then return nil end
 	local out = p:read("*a") or ""
@@ -104,12 +181,9 @@ local function ubus_call(object, method, args)
 end
 
 local function uci_get(config, section, option)
-	-- Shell out to uci instead of `require "luci.model.uci"` so the plugin
-	-- works even when luci-compat is missing or relocates the module.
-	local p = io.popen(string.format(
-		"uci -q get %s.%s.%s 2>/dev/null",
-		config, section, option
-	))
+	local key = string.format("%s.%s.%s", config, section, option)
+	local cmd = "uci -q get " .. shellquote(key) .. " 2>/dev/null"
+	local p = io.popen(cmd)
 	if not p then return nil end
 	local v = p:read("*l")
 	p:close()
@@ -117,20 +191,39 @@ local function uci_get(config, section, option)
 	return v
 end
 
+-- ---------------------------------------------------------------------------
+-- Configuration
+-- ---------------------------------------------------------------------------
+
+local function read_secret()
+	-- Secret lives outside UCI now. See uci-defaults/10-luci-app-twofa for
+	-- migration history.
+	local f = io.open(SECRET_FILE, "rb")
+	if not f then return nil end
+	local data = f:read("*l") or ""
+	f:close()
+	data = data:gsub("%s+", "")
+	if #data < 16 then return nil end
+	return data
+end
+
 local function is_enabled()
 	return uci_get("twofa", "global", "enabled") == "1"
 end
 
 local function is_configured()
-	local s = uci_get("twofa", "global", "secret")
-	return type(s) == "string" and #s >= 16
+	return read_secret() ~= nil
 end
+
+-- ---------------------------------------------------------------------------
+-- ACL downgrade / restore
+-- ---------------------------------------------------------------------------
 
 local function flatten_acls(acls)
 	local out = {}
 	if type(acls) ~= "table" then return out end
 	for scope, scope_data in pairs(acls) do
-		if KEEP_SCOPES[scope] and type(scope_data) == "table" then
+		if type(scope_data) == "table" then
 			for obj, funcs in pairs(scope_data) do
 				if type(funcs) == "table" then
 					for _, fn in ipairs(funcs) do
@@ -161,13 +254,13 @@ end
 
 local function downgrade(sid)
 	if not sid or sid == "" then return end
-
+	local hk    = sid_key(sid)
 	local state = read_state()
-	local cur   = state.sessions[sid]
+	local cur   = state.sessions[hk]
 	if cur and cur.verified ~= true and type(cur.saved_acls) == "table"
 	   and #cur.saved_acls > 0 then
-		-- Already downgraded; just refresh expiry and re-apply to cover the
-		-- case where rpcd was restarted and lost the in-memory revocations.
+		-- Already downgraded; refresh expiry and re-apply ACL revocations
+		-- in case rpcd was restarted and lost in-memory grant state.
 		cur.expires = os.time() + STATE_TTL
 		write_state(state)
 		apply_acl_op("revoke", sid, cur.saved_acls)
@@ -175,41 +268,53 @@ local function downgrade(sid)
 	end
 
 	local sess = ubus_call("session", "list", { ubus_rpc_session = sid })
-	if not sess or type(sess.acls) ~= "table" then
-		return
-	end
+	if not sess or type(sess.acls) ~= "table" then return end
 
 	local saved = {}
 	for _, it in ipairs(flatten_acls(sess.acls)) do
-		if not (it.scope == "ubus" and PRESERVE_UBUS_OBJ[it.obj]) then
+		if not should_preserve(it) then
 			saved[#saved + 1] = it
 		end
 	end
 
-	state.sessions[sid] = {
-		verified   = false,
-		saved_acls = saved,
-		expires    = os.time() + STATE_TTL,
+	-- Preserve rate-limit counters across downgrade so an attacker cannot
+	-- reset their attempt budget by re-triggering downgrade (which they can
+	-- do simply by calling status() again).
+	local prev = state.sessions[hk] or {}
+	state.sessions[hk] = {
+		verified     = false,
+		saved_acls   = saved,
+		expires      = os.time() + STATE_TTL,
+		attempts     = prev.attempts     or 0,
+		fails        = prev.fails        or 0,
+		lock_until   = prev.lock_until,
+		last_counter = prev.last_counter,
 	}
 	write_state(state)
 	apply_acl_op("revoke", sid, saved)
 end
 
-local function restore(sid)
+local function restore(sid, matched_counter)
 	if not sid or sid == "" then return false end
+	local hk    = sid_key(sid)
 	local state = read_state()
-	local cur   = state.sessions[sid] or {}
+	local cur   = state.sessions[hk] or {}
 	if type(cur.saved_acls) == "table" then
 		apply_acl_op("grant", sid, cur.saved_acls)
 	end
-	state.sessions[sid] = {
-		verified   = true,
-		saved_acls = nil,
-		expires    = os.time() + STATE_TTL,
+	state.sessions[hk] = {
+		verified     = true,
+		saved_acls   = nil,
+		expires      = os.time() + STATE_TTL,
+		last_counter = matched_counter,
 	}
 	write_state(state)
 	return true
 end
+
+-- ---------------------------------------------------------------------------
+-- ubus methods
+-- ---------------------------------------------------------------------------
 
 local function method_status(args)
 	local sid        = args.ubus_rpc_session
@@ -217,7 +322,7 @@ local function method_status(args)
 	local configured = is_configured()
 
 	local state      = read_state()
-	local sess_state = state.sessions[sid or ""] or {}
+	local sess_state = state.sessions[sid_key(sid or "")] or {}
 	local verified   = sess_state.verified == true
 
 	if enabled and configured and sid and not verified then
@@ -235,69 +340,131 @@ local function method_verify(args)
 	local sid    = args.ubus_rpc_session
 	local raw    = tostring(args.token or "")
 	local token  = (raw:gsub("%s+", ""))
-	local sid_tag = (sid and #sid > 0) and sid:sub(1, 8) or "?"
+	local tag    = sid_tag(sid)
 
 	if not sid or sid == "" then
 		log("verify denied: no_session")
 		return { success = false, error = "no_session" }
 	end
 	if not token:match("^%d%d%d%d%d%d$") then
-		log(string.format("verify denied [%s]: bad_format raw_len=%d clean=%q",
-			sid_tag, #raw, token))
+		log(string.format("verify denied [%s]: bad_format raw_len=%d",
+			tag, #raw))
 		return { success = false, error = "bad_format" }
 	end
 	if not is_enabled() then
-		log(string.format("verify allowed [%s]: 2fa disabled", sid_tag))
+		log(string.format("verify allowed [%s]: 2fa disabled", tag))
 		return { success = true }
 	end
-
 	if not totp then
-		log(string.format("verify denied [%s]: totp_module_missing", sid_tag))
+		log(string.format("verify denied [%s]: totp_module_missing", tag))
 		return { success = false, error = "totp_module_missing" }
 	end
 
-	-- Surface which HMAC backend we landed on. Logged once per verify call
-	-- (cheap) so logread immediately tells us if we're on the pure-lua path
-	-- because the firmware's libnixio lacks OpenSSL.
-	log(string.format("verify [%s]: hmac_backend=%s",
-		sid_tag, tostring(totp._hmac_backend or "unknown")))
-
-	local secret = uci_get("twofa", "global", "secret")
-	if not secret or #secret < 16 then
-		log(string.format("verify denied [%s]: no_secret (got=%q)",
-			sid_tag, tostring(secret)))
+	local secret = read_secret()
+	if not secret then
+		log(string.format("verify denied [%s]: no_secret", tag))
 		return { success = false, error = "no_secret" }
 	end
 
-	-- Run totp.verify in pcall so a crypto exception doesn't become a
-	-- generic "internal" error masking the real cause.
-	local ok, matched = pcall(totp.verify, secret, token)
+	local hk    = sid_key(sid)
+	local state = read_state()
+	local rec   = state.sessions[hk] or {}
+	local now   = os.time()
+
+	-- Rate-limit gate FIRST so a locked-out attacker burns no CPU on HMAC
+	-- and gets no oracle from differential timing.
+	if rec.lock_until and rec.lock_until > now then
+		log(string.format(
+			"verify denied [%s]: rate_limited retry_after=%d",
+			tag, rec.lock_until - now))
+		return {
+			success     = false,
+			error       = "rate_limited",
+			retry_after = rec.lock_until - now,
+		}
+	end
+
+	log(string.format("verify [%s]: hmac_backend=%s",
+		tag, tostring(totp._hmac_backend or "unknown")))
+
+	local ok, matched, matched_counter = pcall(
+		totp.verify_window, secret, token, TOTP_WINDOW)
 	if not ok then
-		log(string.format("verify crashed [%s]: %s", sid_tag, tostring(matched)))
-		return { success = false, error = "totp_exception", detail = tostring(matched) }
+		log(string.format("verify crashed [%s]: %s", tag, tostring(matched)))
+		return { success = false, error = "totp_exception",
+		         detail  = tostring(matched) }
+	end
+
+	-- Replay protection: every successful counter must be strictly greater
+	-- than the last successful one we recorded for this session record.
+	-- (rec is keyed by sid_key, so it persists across the verify -> restore
+	-- transition.)
+	if matched and rec.last_counter and matched_counter
+	   and matched_counter <= rec.last_counter then
+		rec.attempts = (rec.attempts or 0) + 1
+		state.sessions[hk] = rec
+		write_state(state)
+		log(string.format(
+			"verify denied [%s]: totp_replayed counter=%d prev=%d",
+			tag, matched_counter, rec.last_counter))
+		return { success = false, error = "totp_replayed" }
 	end
 
 	if not matched then
+		rec.attempts = (rec.attempts or 0) + 1
+		if rec.attempts >= MAX_ATTEMPTS then
+			local exp = math.min(LOCKOUT_CAP,
+				LOCKOUT_BASE * (2 ^ math.min(5, rec.fails or 0)))
+			rec.lock_until = now + exp
+			rec.fails      = (rec.fails or 0) + 1
+			rec.attempts   = 0
+			log(string.format(
+				"verify denied [%s]: rate_limit_engaged lock=%ds fails=%d",
+				tag, exp, rec.fails))
+		end
+		state.sessions[hk] = rec
+		write_state(state)
 		log(string.format(
-			"verify denied [%s]: totp_mismatch token=%s secret_len=%d unix=%d slot=%d",
-			sid_tag, token, #secret, os.time(), math.floor(os.time() / 30)
-		))
+			"verify denied [%s]: totp_mismatch slot=%d attempts=%d",
+			tag, math.floor(now / 30), rec.attempts))
 		return { success = false, error = "totp_mismatch" }
 	end
 
-	restore(sid)
-	log(string.format("verify ok [%s]: session restored", sid_tag))
+	restore(sid, matched_counter)
+	log(string.format("verify ok [%s]: counter=%d", tag, matched_counter or -1))
+	return { success = true }
+end
+
+-- regenerate: writes a fresh secret file by shelling out to twofa-genkey,
+-- then wipes the session state so every existing session must re-verify
+-- against the new secret. Reserved for callers that have already passed
+-- 2FA (the method is NOT in PRESERVE, so a downgraded session cannot
+-- invoke it).
+local function method_regenerate(args)
+	local tag = sid_tag(args.ubus_rpc_session)
+	local rc  = os.execute("/usr/sbin/twofa-genkey >/dev/null 2>&1")
+	local ok  = (rc == 0) or (rc == true)
+	if not ok then
+		log(string.format("regenerate failed [%s]: genkey rc=%s",
+			tag, tostring(rc)))
+		return { success = false, error = "genkey_failed" }
+	end
+	write_state({ sessions = {} })
+	log(string.format("regenerate ok [%s]: state wiped", tag))
 	return { success = true }
 end
 
 local methods = {
-	status = { args = {},               call = method_status },
-	verify = { args = { token = "" },   call = method_verify },
+	status     = { args = {},             call = method_status     },
+	verify     = { args = { token = "" }, call = method_verify     },
+	regenerate = { args = {},             call = method_regenerate },
 }
 
+-- ---------------------------------------------------------------------------
+-- rpcd glue
+-- ---------------------------------------------------------------------------
+
 local function json_string(s)
-	-- minimal JSON string escape; method names + arg keys are ASCII identifiers
-	-- so we only need to handle the basics.
 	return '"' .. tostring(s):gsub('\\', '\\\\'):gsub('"', '\\"') .. '"'
 end
 

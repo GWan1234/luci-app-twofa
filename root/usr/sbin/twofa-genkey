@@ -1,0 +1,39 @@
+#!/bin/sh
+# /usr/sbin/twofa-genkey
+#
+# Generate a fresh 16-character base32 TOTP secret and persist it to
+# /etc/twofa.secret with mode 0600. Prints the new secret on success.
+#
+# Refuses to fall back to anything other than /dev/urandom: a deterministic
+# or predictable secret is strictly worse than failing loudly, because the
+# user will not know their 2FA is broken until an attacker exploits it.
+#
+# Atomically replaces the file via mktemp+chmod+mv so there is no window
+# where the secret is readable to anyone other than root.
+
+set -e
+umask 077
+
+SECRET_FILE=${TWOFA_SECRET_FILE:-/etc/twofa.secret}
+
+if [ ! -r /dev/urandom ]; then
+	echo "twofa-genkey: /dev/urandom is not readable" >&2
+	exit 1
+fi
+
+secret="$(tr -dc 'A-Z2-7' </dev/urandom 2>/dev/null | head -c 16)"
+if [ -z "$secret" ] || [ "${#secret}" -ne 16 ]; then
+	echo "twofa-genkey: failed to extract 16 base32 chars from /dev/urandom" >&2
+	exit 1
+fi
+
+dir="$(dirname "$SECRET_FILE")"
+[ -d "$dir" ] || mkdir -p "$dir"
+
+tmp="$(mktemp "${SECRET_FILE}.XXXXXX")"
+chmod 0600 "$tmp"
+printf '%s\n' "$secret" >"$tmp"
+mv -f "$tmp" "$SECRET_FILE"
+chmod 0600 "$SECRET_FILE"
+
+printf '%s\n' "$secret"

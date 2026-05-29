@@ -1,0 +1,40 @@
+#!/bin/sh /etc/rc.common
+# Persistent session-guard daemon for luci-app-twofa.
+#
+# Why this exists: the rpcd plugin downgrades sessions lazily, on every
+# status() call. The browser preload runs status() on page load, but
+# non-browser clients (curl, Python, etc.) that authenticate via JSON-RPC
+# never call status() and would keep full ACLs indefinitely. This service
+# polls `ubus call session list` and invokes status() on every session
+# every POLL_INTERVAL seconds (default 1s), so a freshly-authenticated
+# session is downgraded within ~1s no matter how the caller authenticated.
+#
+# Out of scope: ssh / dropbear. Anyone with the root password can already
+# do anything; this daemon only gates LuCI / rpcd RPC sessions.
+
+USE_PROCD=1
+START=99
+STOP=10
+
+PROG="/usr/sbin/luci-app-twofa-guardd"
+
+start_service() {
+	[ -x "$PROG" ] || {
+		logger -t luci-app-twofa-guard "$PROG missing or not executable; refusing to start"
+		return 1
+	}
+	procd_open_instance "luci-app-twofa-guard"
+	procd_set_param command /usr/bin/lua "$PROG"
+	# respawn <threshold> <timeout> <retry>: if the process exits more than
+	# `retry` times within `threshold` seconds, give up. Generous defaults
+	# so a temporary ubusd glitch at boot doesn't permanently disable us.
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+reload_service() {
+	stop
+	start
+}
